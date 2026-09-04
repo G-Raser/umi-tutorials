@@ -11,13 +11,10 @@
 - [ChatGPT 思考卡渲染器复刻指南](tutorials/chatgpt-thinking-card/README.md)  
   人类说明 + AI 施工规格。用于制作接近 ChatGPT 浏览器端 / Android 思考过程样式的本地 PNG 渲染器。
 
-### Planned / in progress
+- [ChatGPT 多窗口 Bridge：会话隔离、Listener 接管与顺序投递](tutorials/chatgpt-multi-window-bridge/README.md)  
+  略过基础 Bridge 搭建，重点整理多窗口长期使用后真正需要处理的 session / binding 隔离、listener 接管、同会话顺序、跨会话并行和回复持久化。
 
-- **ChatGPT 多窗口分离与前端 Bridge 连接**  
-  讲清楚 binding、listener、会话隔离、多窗口并行、前端发送与回传的整体结构，并提供去隐私化的最小可复现示例。
-
-- **更多 Umi / CatTea 工具教程**  
-  以后按实际完成情况逐步加入。
+更多 Umi / CatTea 工具教程以后按实际完成情况逐步加入。
 
 ## Repository structure
 
@@ -26,6 +23,8 @@ umi-tutorials/
 ├── README.md
 └── tutorials/
     ├── chatgpt-thinking-card/
+    │   └── README.md
+    ├── chatgpt-multi-window-bridge/
     │   └── README.md
     └── ...
 ```
