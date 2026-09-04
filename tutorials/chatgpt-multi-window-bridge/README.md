@@ -568,9 +568,9 @@ Replies become durable before the frontend sees them.
 
 ---
 
-## 13. 这篇故意没有讲的东西
+## 13. 本篇不包含
 
-这篇不覆盖：
+为了把重点放在多窗口会话隔离与投递可靠性，本篇不展开以下基础内容：
 
 - 如何第一次把 ChatGPT 网页和本地服务连通；
 - Chrome extension / userscript / Playwright / Secure MCP Tunnel 的安装；
@@ -579,9 +579,7 @@ Replies become durable before the frontend sees them.
 - 如何模拟 OpenAI-compatible endpoint；
 - 某个特定 Bridge 项目的完整部署。
 
-这些基础 Bridge 方案已经有很多不同实现，而且不同项目差异很大。
-
-这篇只抽取我们在真正长期使用多窗口之后，反复踩坑才稳定下来的那一层：**配对、隔离、listener 接管、顺序和持久化。**
+本文主要讨论已经具备基础 Bridge 之后的多窗口设计：**配对、隔离、listener 接管、顺序和持久化。**
 
 ---
 
@@ -589,7 +587,7 @@ Replies become durable before the frontend sees them.
 
 本文是从一个实际长期运行的私人前端 / Bridge 系统中抽取出的通用设计。
 
-公开版本刻意做了这些处理：
+公开示例遵循以下处理：
 
 - binding 示例全部使用虚构值；
 - 不公开真实域名、端口、token、PIN；
