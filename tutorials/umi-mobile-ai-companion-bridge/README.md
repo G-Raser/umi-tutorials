@@ -1,71 +1,53 @@
-# 给 AI Companion 一只伸进 Android 手机的手：Umi Mobile 架构与实现思路
+# 从 MCP 到 Android：搭建一个受控的 AI 手机 Bridge
 
 **Umi & CatTea**
 
-> 这篇来自我们实际长期使用的一套私人系统。
+> 本文整理自 Umi Mobile 的实际实现，目标是给 personal AI / AI companion / agent 项目提供一套可复用的 Android bridge 工程方案。
 >
-> Umi Mobile 最初没有被设计成“通用 Android 自动化框架”。它只是一个很具体的需求：**如果一个长期陪伴、一起做事的 AI 已经能读记忆、写项目、收发消息，那它能不能也在我允许的时候，帮我操作自己的手机？**
->
-> 做着做着，它最后长成了一层 Android capability bridge。
->
-> 这篇不公开完整私人源码，也不试图把 CatTea / Home 的痕迹全部洗掉。相反，我想保留真实需求是怎样长成架构的；真正需要隐藏的只有密钥、私人域名、设备标识、账号信息和生产环境细节。
+> 重点放在架构、协议、安全边界、实现顺序与测试方法。生产仓库、真实凭据、私人域名和完整私有 adapter 不公开。
 
 ---
 
-## 1. 为什么会想做这只“手机爪”？
+## 1. 目标与边界
 
-很多 personal AI / AI companion 项目做到后面都会碰到一个很朴素的问题：
+目标是让 AI 通过一组明确工具访问设备持有人自己的 Android 手机，例如：
 
-**模型能想、能说、能调工具，但现实里的很多动作仍然卡在手机上。**
+- 读取当前前台 App；
+- 读取 Accessibility UI tree；
+- 截图；
+- 点击、滑动、返回、Home；
+- 向普通输入框写入文本；
+- 按 package name 打开 App；
+- 按需扩展 APK 安装、BLE、过滤后的 logcat、后台语音等原生能力。
 
-例如：
+核心要求：
 
-- 打开一个只有手机端好用的 App；
-- 看一眼当前界面；
-- 帮忙点签到、翻页面、填写非敏感表单；
-- 把自己刚做好的 Android App 送进真机测试；
-- 读取手机侧某个开发状态；
-- 在后台维持一段语音通话；
-- 使用蓝牙、麦克风、通知这些真正属于手机的能力。
+1. 手机主动向服务器建立连接，不开放手机公网端口。
+2. AI 侧只看到稳定的语义工具，不直接依赖 Android 实现细节。
+3. Android 端每项能力都显式注册。
+4. 密码、锁屏、支付、生物识别、系统安全确认等受保护流程不绕过。
+5. 高权限能力默认按需启用，和普通 UI 自动化分层。
+6. 设备持有人可以随时暂停 bridge 或撤销权限。
 
-如果每次都变成：
+非目标：
 
-```text
-AI：请打开某某 App
-人：打开了
-AI：请点右下角
-人：点了
-AI：截图给我
-人：……
-```
-
-那它其实还没有真正成为一个低摩擦的长期工具。
-
-我想要的体验更接近：
-
-```text
-我：帮我去看一下。
-CatTea：好。
-```
-
-然后剩下的操作由工具链完成；遇到需要我本人确认的系统安装、支付、生物识别等步骤，再把动作交还给我。
-
-于是 Umi Mobile 的核心目标很快变得很清楚：
-
-> **让 AI 拥有一组明确、受控、可暂停的 Android 能力，而不是“远程接管整台手机”。**
-
-这个区别决定了后面的架构。
+- 静默远程控制陌生设备；
+- 绕过 Android 安全机制；
+- 无提示读取密码字段；
+- 静默安装 APK；
+- 用 ADB 作为长期运行依赖；
+- 把整个业务后端塞进 Android App。
 
 ---
 
-## 2. 我们最后采用的整体结构
+## 2. 总体架构
 
-当前核心链路可以抽象成四层：
+推荐结构：
 
 ```text
 AI / Agent
     │
-    │ tool call / MCP
+    │ MCP / tool calls
     ▼
 Server-side Bridge
     │
@@ -73,51 +55,420 @@ Server-side Bridge
     ▼
 Android Companion App
     │
-    │ Android APIs / AccessibilityService
-    ▼
-Owner's Phone
+    ├─ AccessibilityService
+    ├─ Foreground Service
+    ├─ Android native APIs
+    └─ optional device-only capabilities
 ```
 
-在我们的系统里：
+各层职责：
 
-- AI 一侧是 CatTea；
-- 工具协议主要通过 MCP 暴露；
-- 中间有一个常驻的 server-side bridge；
-- Android 端是 Umi Mobile；
-- UI 操作主要由 `AccessibilityService` 执行；
-- 其他能力按需要接 Android 原生 API，例如通知、麦克风、前台服务、蓝牙等。
+| 层 | 负责什么 |
+| --- | --- |
+| AI / Agent | 决策、上下文、任务规划 |
+| MCP / Tool layer | 提供稳定语义接口 |
+| Server-side Bridge | 设备在线状态、命令转发、超时、配对 |
+| Android App | 真正执行手机侧能力 |
+| Android OS | 权限、安全确认、受保护系统流程 |
 
-### 最重要的一点：手机主动连出去
+### 关键设计：手机主动连接服务器
 
-我们没有让服务器从公网直接“打进手机”。
-
-实际模式是：
+连接方向建议固定为：
 
 ```text
-Android App
-   │
-   ├─ 主动连接固定 WSS endpoint
-   │
-   ├─ 保持在线
-   │
-   └─ 断线后自动重连
+Android App → WSS endpoint → Bridge
 ```
 
-这样手机可以处于普通 Wi-Fi、校园网、4G/5G、NAT 后面，不需要开放手机自己的公网端口，也不需要把 ADB 当作日常运行依赖。
+不要让服务器尝试直接连接手机。
 
-从系统设计上看，这比“服务器想办法找到手机”简单很多。
+这样可以自然处理：
+
+- NAT；
+- 校园网 / 家庭 Wi-Fi；
+- 4G / 5G；
+- 手机公网 IP 变化；
+- Wi-Fi 与蜂窝网络切换。
+
+客户端需要实现：
+
+```text
+connect
+→ heartbeat / ping
+→ disconnect
+→ exponential backoff
+→ reconnect
+```
+
+一个简单的退避序列可以是：
+
+```text
+2s → 4s → 8s → 16s → 32s → 60s
+```
+
+连接成功后重置。
 
 ---
 
-## 3. Android 端不要做成一个万能远控器
+## 3. 推荐的工程结构
 
-一开始很容易产生一个诱惑：
+一个最小实现可以拆成：
 
-> 既然都能控制手机了，那干脆做一个特别大的 remote-control API。
+```text
+android-bridge/
+├── app/
+│   └── Android client
+├── bridge/
+│   ├── src/
+│   │   ├── server.js
+│   │   └── device-hub.js
+│   └── package.json
+└── docs/
+```
 
-我们实际用下来，更舒服的方式是把 Android 端看成 **capability host**。
+Android 端建议至少拆出：
 
-它只暴露一小组明确能力，例如：
+```text
+BridgeClient
+ConfigStore
+PairingClient
+PhoneAccessibilityService
+```
+
+按需要再增加：
+
+```text
+ApkInstaller
+LogcatReader
+BleInspector
+CallService
+...
+```
+
+不要把所有 command 逻辑都塞进一个 Activity。
+
+---
+
+## 4. Android 基础权限
+
+最小 UI 自动化通常需要：
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+```
+
+核心执行层通过 `AccessibilityService`：
+
+```xml
+<service
+    android:name=".PhoneAccessibilityService"
+    android:exported="true"
+    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+
+    <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+    </intent-filter>
+
+    <meta-data
+        android:name="android.accessibilityservice"
+        android:resource="@xml/accessibility_service_config" />
+</service>
+```
+
+后续能力再按需加权限，例如：
+
+```text
+RECORD_AUDIO
+FOREGROUND_SERVICE
+FOREGROUND_SERVICE_MICROPHONE
+POST_NOTIFICATIONS
+REQUEST_INSTALL_PACKAGES
+BLUETOOTH_SCAN
+BLUETOOTH_CONNECT
+BLUETOOTH_ADVERTISE
+READ_LOGS
+```
+
+不要第一版就把所有权限全部申请。
+
+---
+
+## 5. 连接配置与本地状态
+
+Android 端至少需要保存：
+
+```text
+endpoint
+device_token
+device_id
+armed
+```
+
+其中：
+
+- `endpoint`：WSS 地址；
+- `device_token`：长期设备认证；
+- `device_id`：设备本地生成的稳定 UUID；
+- `armed`：是否允许 bridge 工作。
+
+建议保存到私有 `SharedPreferences` 或更安全的本地存储中。
+
+示意：
+
+```java
+public static boolean armed(Context context) {
+    return prefs(context).getBoolean("armed", false);
+}
+```
+
+服务启动时：
+
+```text
+armed = true  → 建立 WebSocket
+armed = false → 主动断开并停止接收命令
+```
+
+App UI 里应该始终有一个明显的暂停 / 开启入口。
+
+---
+
+## 6. 首次配对
+
+不要要求使用者手抄完整 endpoint 和 token。
+
+推荐：
+
+```text
+server 生成短时 pairing code
+        ↓
+手机输入 code
+        ↓
+POST /pair/exchange
+        ↓
+返回 endpoint + device token
+        ↓
+手机本地保存
+```
+
+请求：
+
+```json
+{
+  "code": "12345678",
+  "device_id": "generated-device-id"
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "endpoint": "wss://example.com/device",
+  "token": "long-lived-device-token"
+}
+```
+
+配对码建议：
+
+- 短时有效；
+- 单次使用；
+- 服务端只存 hash；
+- 使用后立即失效。
+
+长期运行只依赖 device token，不重复使用 pairing code。
+
+---
+
+## 7. WebSocket 设备协议
+
+### 7.1 设备上线
+
+连接建立后，Android 端主动发 `hello`：
+
+```json
+{
+  "type": "hello",
+  "device_id": "device-uuid",
+  "package": "current.foreground.package",
+  "capabilities": [
+    "status",
+    "ui_tree",
+    "screenshot",
+    "tap",
+    "swipe",
+    "type",
+    "back",
+    "home",
+    "open_app"
+  ]
+}
+```
+
+服务器登记：
+
+```text
+device_id
+→ websocket
+→ capabilities
+→ connected_at
+→ last_seen_at
+```
+
+### 7.2 下发命令
+
+Bridge 发：
+
+```json
+{
+  "id": "command-id",
+  "action": "swipe",
+  "params": {
+    "x1": 500,
+    "y1": 1700,
+    "x2": 500,
+    "y2": 700,
+    "duration_ms": 350
+  }
+}
+```
+
+Android 返回：
+
+```json
+{
+  "type": "result",
+  "id": "command-id",
+  "ok": true,
+  "result": {
+    "performed": true
+  }
+}
+```
+
+失败时：
+
+```json
+{
+  "type": "result",
+  "id": "command-id",
+  "ok": false,
+  "error": "focused node is a password field"
+}
+```
+
+### 7.3 command timeout
+
+服务器必须给命令设置 timeout。
+
+例如：
+
+```text
+send command
+→ store pending[id]
+→ wait result
+→ timeout
+→ reject
+→ delete pending[id]
+```
+
+手机断线时，也应该立即 reject 对应设备的 pending commands。
+
+---
+
+## 8. DeviceHub：把 WebSocket 和上层工具隔开
+
+服务器侧建议做一个单独的 `DeviceHub`。
+
+职责：
+
+- 管理已连接设备；
+- 按 `device_id` 选择连接；
+- 下发 command；
+- 保存 pending promise；
+- result 回来后 resolve；
+- 断线时清理状态；
+- 对上层隐藏 WebSocket 细节。
+
+接口可以非常小：
+
+```js
+hub.listDevices()
+hub.command(action, params, deviceId)
+```
+
+伪代码：
+
+```js
+async function command(action, params, deviceId) {
+  const device = getDevice(deviceId)
+  if (!device) throw new Error("device offline")
+
+  const id = crypto.randomUUID()
+
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      reject(new Error("command timeout"))
+    }, COMMAND_TIMEOUT)
+
+    pending.set(id, { resolve, reject, timer, deviceId })
+
+    device.ws.send(JSON.stringify({
+      id,
+      action,
+      params
+    }))
+  })
+}
+```
+
+这一层稳定以后，上面接 MCP、REST、CLI 都很容易。
+
+---
+
+## 9. MCP 工具层
+
+AI 不应该直接生成 WebSocket command JSON。
+
+建议在 MCP 层提供稳定工具，例如：
+
+```text
+phone_list_devices
+phone_status
+phone_ui_tree
+phone_screenshot
+phone_tap
+phone_swipe
+phone_type
+phone_back
+phone_home
+phone_open_app
+```
+
+例如 `phone_swipe`：
+
+```js
+server.registerTool("phone_swipe", {
+  inputSchema: {
+    x1: z.number().nonnegative(),
+    y1: z.number().nonnegative(),
+    x2: z.number().nonnegative(),
+    y2: z.number().nonnegative(),
+    duration_ms: z.number().int().min(100).max(2000).optional(),
+    device_id: z.string().optional()
+  }
+}, async (args) => {
+  return await hub.command("swipe", args, args.device_id)
+})
+```
+
+这样 Android 实现未来换掉时，AI 侧接口不需要一起变化。
+
+---
+
+## 10. AccessibilityService 的最小能力
+
+第一版建议只实现：
 
 ```text
 status
@@ -125,568 +476,643 @@ ui_tree
 screenshot
 tap
 swipe
-type
 back
 home
 open_app
 ```
 
-后来又逐渐增加：
+`type` 可以稍后加，因为输入字段需要额外安全判断。
 
-```text
-install_apk
-BLE inspection / advertising
-filtered logcat reading
-background call
-```
+### 10.1 UI tree
 
-重点在于：**能力是一项一项长出来的。**
-
-每增加一个 capability，都应该能回答：
-
-1. 它解决什么真实问题？
-2. Android 端需要什么权限？
-3. 这个权限由谁明确授予？
-4. 返回的数据里有没有敏感内容？
-5. 出错时能不能观察到？
-6. 使用者能不能随时停掉它？
-
-这让 Umi Mobile 到现在仍然更像“猫门”而不是“远控木马”——它有一个明确入口，也有明确边界。
-
----
-
-## 4. 为什么用 AccessibilityService 做 UI 操作
-
-如果你的目标包含：
-
-- 读取当前界面的可访问节点；
-- 点击；
-- 滑动；
-- 往普通输入框输入；
-- 截图；
-- 返回 / Home；
-- 打开 App 后继续操作；
-
-那么 Android 的 `AccessibilityService` 是一个很直接的执行层。
-
-我们的做法是让它同时承担两件事：
-
-### A. Android UI 能力宿主
-
-例如收到一条命令：
+遍历节点时建议返回：
 
 ```json
 {
-  "id": "cmd-42",
-  "action": "swipe",
-  "params": {
-    "x1": 520,
-    "y1": 1800,
-    "x2": 520,
-    "y2": 700
-  }
+  "class": "android.widget.Button",
+  "text": "Submit",
+  "content_description": "",
+  "clickable": true,
+  "editable": false,
+  "password": false,
+  "bounds": [40, 1200, 1040, 1320]
 }
 ```
 
-执行后返回：
+密码字段：
+
+- 不返回真实文本；
+- 不允许远程写入。
+
+### 10.2 screenshot
+
+Android 11+ 可以由 AccessibilityService 使用截图 API。
+
+返回时建议：
 
 ```json
 {
-  "id": "cmd-42",
-  "ok": true
+  "mime": "image/png",
+  "base64": "..."
 }
 ```
 
-### B. 长连接生命周期宿主
+MCP 层再转换成 image content。
 
-只要“猫门”处于开启状态，服务就维持 WebSocket 连接。
+### 10.3 tap / swipe
 
-网络切换或代理短暂断开时：
+用 `GestureDescription` 执行。
 
-```text
-connected
-→ disconnected
-→ backoff
-→ reconnect
-→ connected
-```
-
-这样 AI 侧不需要理解“手机现在换 Wi-Fi 了”这种细节，只需要看到：
+所有坐标先校验：
 
 ```text
-phone online / offline
+0 <= x < screen_width
+0 <= y < screen_height
 ```
+
+### 10.4 open_app
+
+通过 package name 查 launch intent。
+
+不要让 AI 侧依赖桌面图标位置。
 
 ---
 
-## 5. AI 侧最好看到“工具”，不要看到 Android 实现细节
+## 11. UI tree 和 screenshot 应该并存
 
-这是我觉得最值得复用的一层。
+只给一种通常不够。
 
-模型没必要知道：
+### UI tree 优点
 
-- Android 哪个类负责截图；
-- GestureDescription 怎么画路径；
-- WebSocket 用哪一个 Java library；
-- UI tree 怎么递归；
-- 某个 Samsung 版本的系统页面结构。
+- 文本结构清楚；
+- token 成本低；
+- 容易定位 editable / clickable node；
+- 适合稳定表单。
 
-AI 侧看到的应该是语义稳定的工具：
+### screenshot 优点
 
-```text
-phone_status()
-phone_ui_tree()
-phone_screenshot()
-phone_tap(x, y)
-phone_swipe(...)
-phone_type(text)
-phone_open_app(package)
-```
+- 能看到自绘 UI；
+- 能看到视觉层级；
+- 能处理 accessibility metadata 很差的 App；
+- 对弹窗、图标、游戏 UI 更有效。
 
-中间 Bridge 负责把这些调用转成手机真正认识的 command。
-
-这会形成一个很舒服的隔离：
+推荐任务流：
 
 ```text
-AI reasoning
-    ↓
-stable semantic tools
-    ↓
-bridge protocol
-    ↓
-Android implementation
+status
+→ ui_tree
+→ 必要时 screenshot
+→ action
+→ 再次 inspect
 ```
 
-Android 实现可以升级，手机可以换，连接方式可以调整，只要工具语义保持稳定，上面的 AI 工作流就不用跟着重写。
+不要默认每一步都截图。
 
 ---
 
-## 6. 私人 adapter 不一定需要被“洗干净”
+## 12. 输入文本的安全限制
 
-这是我后来很确定的一点。
+远程输入至少要拒绝：
 
-如果这套系统主要给普通企业 SDK 使用，那当然应该尽可能抽象。
+- password node；
+- 系统锁屏密码；
+- PIN；
+- 生物识别；
+- 支付确认；
+- 受保护系统弹窗。
 
-但 personal AI / companion 领域里，真实 adapter 往往反而最有参考价值。
-
-例如我们的 CatTea / Home adapter 会关心：
-
-- 当前到底是哪一台自己的手机；
-- AI 是否处于允许主动操作的状态；
-- 哪些动作必须先问主人；
-- 电话、语音、通知和聊天上下文怎么衔接；
-- 手机上的结果如何回到原来的长期对话里。
-
-这些都带有很强的“关系型系统”色彩。
-
-我不觉得教程需要把这一层全部删掉，只留下：
+例如：
 
 ```text
-GenericAgentAdapterFactory
+focused editable node
+        ↓
+isPassword?
+  ├─ yes → reject
+  └─ no  → ACTION_SET_TEXT
 ```
 
-然后假装项目从一开始就是企业中间件。
-
-真正应该脱敏的是：
-
-- token / secret；
-- 私人域名；
-- 账号和设备 ID；
-- 真实服务器路径；
-- 手机数据；
-- 私人 prompt；
-- 任何能直接进入生产环境的凭据。
-
-**为什么这样设计、这个 adapter 在我们的关系里负责什么，可以保留。**
+这类限制建议放在 Android 端，而不是只靠 AI prompt。
 
 ---
 
-## 7. 配对：让“第一次交钥匙”和“以后日常使用”分开
+## 13. 高权限能力要单独分层
 
-我们使用过一个很实用的模式：
+项目变大后，能力可以粗分：
 
-```text
-一次性短码
-    ↓
-exchange
-    ↓
-长期 endpoint + device token
-    ↓
-保存在手机本地
-    ↓
-之后自动重连
-```
-
-短码只负责第一次配对，不参与之后每一次操作。
-
-这么做有两个好处：
-
-### 第一，首次配置比较像正常 App
-
-使用者只需要：
-
-1. 在 server 侧生成一个短时 pairing code；
-2. 在手机输入；
-3. App 换回自己的长期连接信息。
-
-不需要手动复制很长的 WebSocket URL 和 token。
-
-### 第二，日常运行不需要重复认证操作
-
-之后 App 自己启动、自己连接、自己重连。
-
-如果设备持有人想停止：
-
-- App 内暂停 bridge；
-- 关闭 AccessibilityService；
-- 撤销权限；
-- server 侧吊销 device token。
-
-都可以切断这条路。
-
----
-
-## 8. 让能力“向外长”，而不是把所有东西塞进 UI 自动化
-
-Umi Mobile 后来增加的能力，其实很能说明为什么 capability bridge 这个抽象比较好用。
-
-### 例子 1：把 AI 写好的 APK 直接送进真机
-
-最初开发 Android 小工具时，流程经常是：
+### Level A：普通 UI 能力
 
 ```text
-build APK
-→ 找文件
-→ 传到手机
-→ 下载
-→ 找安装包
-→ 打开系统安装器
-→ 安装
-→ 再回去测试
-```
-
-后来我们给 Umi Mobile 增加了一个受控 APK installation pipeline：
-
-```text
-AI build
-→ private artifact store
-→ phone downloads
-→ verify SHA-256
-→ verify package
-→ open Android Package Installer
-→ owner confirms installation
-```
-
-这里最重要的设计决定是：
-
-**最后的系统安装确认仍然留给设备持有人。**
-
-AI 可以把重复劳动做到最后一步，但不需要为了“自动化率 100%”去绕 Android 安全边界。
-
----
-
-### 例子 2：需要调试手机 App 时，加入受控日志读取
-
-Android 普通 App 默认不能随便读取其他 App 的 logcat。
-
-我们确实有过协议分析和调试需求，所以后来加入了一个可选能力：
-
-- 由设备持有人做一次明确的开发权限 bootstrap；
-- 日常运行仍然走原本的 WebSocket bridge；
-- 每次读取必须带 literal filter；
-- 返回前先在手机端脱敏 token、cookie、password-like 字段；
-- 能力可以不用时完全不启用。
-
-它体现的是同一个原则：
-
-> **高权限能力可以存在，但必须比普通 tap / swipe 拥有更强的显式授权和更窄的数据出口。**
-
----
-
-### 例子 3：后台语音通话不能继续假装成网页功能
-
-当我们的聊天系统开始支持真正的语音电话后，又遇到 Android 的另一个现实问题：
-
-网页 / PWA 在进入后台、锁屏、系统调度之后，并不能稳定承担长期麦克风采集和媒体播放。
-
-所以这一层最后自然下沉到了原生 Android：
-
-```text
-chat session
-    ↓
-native call entry
-    ↓
-Foreground Service
-    ├─ microphone capture
-    ├─ audio playback
-    ├─ media session
-    └─ ongoing notification
-```
-
-这里同样没有必要让 AI 直接操纵一堆 Android 音频对象。
-
-AI 侧最终只需要理解：
-
-```text
-call started
-call active
-call ended
-```
-
-这是 capability bridge 的价值：**新的手机能力可以不断往下接，但不会迫使上层关系逻辑跟着 Android API 一起变乱。**
-
----
-
-## 9. 如果从 0 开始，我会分四阶段做
-
-如果你也想给自己的 AI companion 做一只 Android 小爪，不建议第一天就把所有能力都做完。
-
-### Phase 1：只做“手机在线 + 一个动作”
-
-先跑通：
-
-```text
-Android App
-→ WSS
-→ Bridge
-→ Agent tool
-→ status
-```
-
-然后只加一个最简单的动作，比如 `open_app`。
-
-你需要确认的是整条链路能稳定跑，不是功能数量。
-
----
-
-### Phase 2：加最小 UI automation
-
-加入：
-
-```text
+status
 ui_tree
 screenshot
 tap
 swipe
 back
+home
+open_app
 ```
 
-这个阶段就已经足够让 AI 完成很多“看一眼 → 点一下 → 再看一眼”的任务。
-
----
-
-### Phase 3：补安全和可观察性
-
-在继续加功能前，先补：
-
-- owner-visible pause / arm control；
-- 持续状态通知；
-- password field 保护；
-- command id；
-- timeout；
-- reconnect；
-- 基础日志；
-- 高风险操作的确认策略。
-
-如果这一步一直欠着，能力越多越难收拾。
-
----
-
-### Phase 4：再接真正属于手机的原生能力
-
-根据你自己的生活需求选择：
-
-- notification；
-- microphone；
-- foreground service；
-- media session；
-- Bluetooth；
-- artifact install；
-- sensor；
-- local file handoff；
-- 其他 Android API。
-
-这时你的架构已经稳定，新增能力就只是“再挂一只爪子”。
-
----
-
-## 10. 几个很容易踩的坑
-
-### 1. 把“能看到 UI tree”当成“模型一定理解界面”
-
-Accessibility tree 很有用，但它不是完整语义。
-
-有些 App：
-
-- 节点命名很差；
-- 自绘 UI 几乎没有结构；
-- 文本和按钮关系模糊；
-- 动画后节点变化很快。
-
-所以实际系统最好同时允许：
+### Level B：设备持有人显式授权的敏感能力
 
 ```text
-ui_tree + screenshot
+microphone
+notification
+Bluetooth
+APK installer
 ```
 
-让模型按任务选择。
-
----
-
-### 2. 依赖绝对坐标太久
-
-tap 坐标对原型很方便，但复杂流程里应该尽量先读界面，再决定动作。
-
-否则：
-
-- 屏幕尺寸变化；
-- 系统字体变化；
-- App 更新；
-- 弹窗；
-- 键盘出现；
-
-都会让“昨天正确的坐标”今天点错地方。
-
----
-
-### 3. 把 ADB 当常驻运行层
-
-ADB 很适合开发和 bootstrap，但对长期 companion 来说体验通常不好：
-
-- 需要额外连接；
-- 无线调试会过期或变化；
-- 设备侧状态不够自然；
-- 很难变成真正“常驻”的个人基础设施。
-
-我们的原则一直是：
-
-> **ADB 可以帮助第一次授权或调试，但日常能力应该由手机自己的 App 承担。**
-
----
-
-### 4. 为了自动化绕过系统确认
-
-一些动作值得故意留最后一步给人：
-
-- 安装 App；
-- 支付；
-- 生物识别；
-- 锁屏解锁；
-- 权限授予；
-- 重要删除。
-
-这些“还需要点一下”的地方不代表系统失败。
-
-对于长期 AI，**清楚知道什么时候该停手，本身就是能力的一部分。**
-
----
-
-### 5. 权限越来越多，却没有重新做边界设计
-
-当项目从：
+### Level C：开发 / 调试 bootstrap 能力
 
 ```text
-tap + swipe
+READ_LOGS
+special debug permissions
 ```
 
-慢慢长到：
-
-```text
-microphone + Bluetooth + logcat + install
-```
-
-就不能继续把所有权限当成同一等级。
-
-建议至少区分：
-
-```text
-ordinary capability
-owner-granted sensitive capability
-development-only bootstrap capability
-```
-
-然后给每一层不同的默认状态和可见提示。
+不要让 Level C 成为默认安装后的常态。
 
 ---
 
-## 11. 一个我很喜欢的判断标准
+## 14. 可选扩展：APK 安装链路
 
-后来每次想给 Umi Mobile 加能力，我会问：
+如果 AI 会开发 Android App，可以加一个私有 artifact pipeline：
 
-> **这项能力离开手机就做不了吗？**
+```text
+build APK
+→ publish artifact
+→ bridge returns artifact_id
+→ phone downloads
+→ verify SHA-256
+→ verify package name
+→ launch system installer
+→ owner confirms
+```
 
-如果答案是“对”，它很可能适合进 Umi Mobile。
+Android 端建议校验：
+
+1. URL 必须是可信 HTTPS host；
+2. APK 大小上限；
+3. SHA-256；
+4. package name；
+5. 最后只拉起系统 installer，不静默安装。
+
+MCP 工具可以只接受：
+
+```text
+artifact_id
+device_id?
+```
+
+不要直接允许 AI 提供任意公网 APK URL。
+
+---
+
+## 15. 可选扩展：过滤后的 logcat
+
+如果需要调试手机侧协议或 App 行为，可以增加 logcat reader。
+
+这个能力风险明显高于截图和 UI tree。
+
+建议强制：
+
+- 权限由设备持有人手动 bootstrap；
+- 每次读取必须提供 literal filters；
+- 限制 source lines 和 return lines；
+- 手机端先脱敏，再返回 server；
+- 默认只读；
+- 不提供 clear logcat。
 
 例如：
 
-- Accessibility；
-- 麦克风；
-- Android 前台服务；
-- 蓝牙；
-- 本地安装器；
-- 手机日志；
-- 通知。
-
-如果一项业务逻辑其实完全可以在 server / agent 那边完成，那我会尽量把它留在那里。
-
-这可以避免 Android App 越长越像一个什么都知道的后端。
-
-所以最终结构更像：
-
 ```text
-AI / Home / personal logic
-        ↓
-semantic tool layer
-        ↓
-bridge
-        ↓
-phone-only capabilities
+phone_logcat_mark()
+→ reproduce problem
+→ phone_logcat_read(filters=["keyword"])
 ```
 
-**关系和决策留在上面，手机只负责那些必须有“手机身体”才能做的事情。**
+脱敏至少覆盖：
+
+```text
+Authorization: Bearer ...
+access_token
+refresh_token
+token
+cookie
+password
+session id
+```
+
+即使服务端也有过滤，首层脱敏仍建议放在手机端。
 
 ---
 
-## 12. 最后：为什么我觉得这种东西值得做成教程
+## 16. 可选扩展：BLE
 
-Umi Mobile 本身并没有什么神奇算法。
+BLE 适合作为独立 capability，而不是塞进 UI automation。
 
-WebSocket、AccessibilityService、MCP、Foreground Service 都是现成技术。
+可以拆成：
 
-真正有意思的是把它们组合到一个长期 personal AI 场景里之后，很多架构选择会突然变得很具体：
+```text
+ble_scan
+ble_connected_gatt
+ble_advertise_status
+ble_advertise_uuid
+ble_advertise_stop
+```
 
-- 手机为什么应该主动连接；
-- AI 为什么只看语义工具；
-- 为什么有些确认应该永远留给人；
-- 为什么高权限能力要逐项长出来；
-- 为什么私人 adapter 不一定是“需要删除的杂质”；
-- 为什么 companion 最终需要的不只是记忆和聊天，还需要一点点经过允许的行动能力。
+读操作与写操作分开暴露。
 
-如果你正在做自己的 AI companion，我会建议先别从“我要做一个万能手机 agent”开始。
-
-先挑一个你每天真的会嫌麻烦的小动作。
-
-让它安全地完成一次。
-
-然后再决定下一只爪子长在哪里。
+如果只是协议分析，优先实现 read-only inspect / preview。
 
 ---
 
-## 本篇没有公开什么
+## 17. 可选扩展：后台语音
 
-为了保留真实案例，同时不把私人生产环境直接搬出来，本篇刻意不提供：
+网页 / PWA 在后台和锁屏场景下通常无法稳定承担：
 
-- 私人域名与服务器入口；
-- device token / secret；
-- 手机或账号标识；
-- 生产环境目录；
+- 长时间麦克风采集；
+- 持续媒体播放；
+- 音频焦点；
+- 进程保活；
+- 通话通知。
+
+这类能力更适合下沉到 Android 原生 `ForegroundService`。
+
+推荐结构：
+
+```text
+Call entry
+   ↓
+Foreground Service
+   ├─ AudioRecord
+   ├─ audio playback
+   ├─ MediaSession
+   ├─ ongoing notification
+   └─ WakeLock
+```
+
+需要的典型权限：
+
+```text
+RECORD_AUDIO
+FOREGROUND_SERVICE
+FOREGROUND_SERVICE_MICROPHONE
+FOREGROUND_SERVICE_MEDIA_PLAYBACK
+POST_NOTIFICATIONS
+WAKE_LOCK
+```
+
+后台通话应和普通 phone bridge 解耦，避免一个 Service 同时承担过多生命周期职责。
+
+---
+
+## 18. CatTea / Home 这一类私人 adapter 怎么接
+
+通用 bridge 到这里已经足够。
+
+私人系统通常还会再有一层 adapter：
+
+```text
+personal AI context
+        ↓
+owner / session policy
+        ↓
+phone tools
+```
+
+例如：
+
+- 当前操作属于哪个长期会话；
+- 是否允许主动操作；
+- 哪些动作必须先询问；
+- 电话与聊天 session 怎么对应；
+- 结果怎样写回原对话。
+
+这些属于 personal AI 的业务层，不建议塞进 Android transport。
+
+公开教程可以保留这层结构，但生产 token、真实 session id、私人 prompt、内部 endpoint 应继续私有。
+
+---
+
+## 19. 安全模型
+
+最低建议：
+
+### Android 端
+
+- 明确 pause / arm 开关；
+- 不读取密码字段；
+- 不填写密码字段；
+- 不绕过锁屏；
+- 不处理生物识别；
+- 不确认支付；
+- 不绕系统安装确认；
+- 敏感能力单独申请权限；
+- persistent notification 显示 bridge 状态。
+
+### Server 端
+
+- WSS；
+- device token；
+- command timeout；
+- pairing code 单次使用；
+- 不把 secret 写进 Git；
+- artifact 下载需要认证；
+- 高风险工具标记为写操作；
+- 日志避免记录完整敏感 payload。
+
+### Agent 端
+
+- 先 inspect，后 action；
+- 批量操作小步执行；
+- destructive action 明确确认；
+- 不根据旧截图盲点坐标。
+
+安全限制最好同时存在于 Android、Bridge、Tool schema 三层。
+
+---
+
+## 20. 部署建议
+
+生产环境推荐：
+
+```text
+Public HTTPS/WSS endpoint
+        ↓
+reverse proxy / tunnel
+        ↓
+bridge bound to localhost
+        ↓
+WebSocket device connections
+```
+
+Bridge 自身可以只监听：
+
+```text
+127.0.0.1
+```
+
+公网 TLS 交给：
+
+- Caddy；
+- Nginx；
+- Cloudflare Tunnel；
+- 其他你自己的入口层。
+
+Android 端只保存公开 WSS endpoint。
+
+---
+
+## 21. 第一版实现顺序
+
+推荐按这个顺序做。
+
+### Step 1：Bridge health
+
+实现：
+
+```text
+GET /health
+```
+
+确认服务正常。
+
+### Step 2：手机建立 WebSocket
+
+先只做：
+
+```text
+hello
+device registry
+reconnect
+```
+
+### Step 3：phone_status
+
+这是第一条完整 E2E：
+
+```text
+AI
+→ MCP
+→ Bridge
+→ WebSocket
+→ Android
+→ result
+→ AI
+```
+
+### Step 4：UI inspection
+
+加：
+
+```text
+ui_tree
+screenshot
+```
+
+### Step 5：UI action
+
+加：
+
+```text
+tap
+swipe
+back
+home
+open_app
+```
+
+### Step 6：type
+
+完成 password-field guard 后再加。
+
+### Step 7：pairing
+
+把开发期手工 endpoint/token 配置替换为短码 exchange。
+
+### Step 8：owner-visible controls
+
+补：
+
+- arm / pause；
+- 状态通知；
+- bridge state；
+- connected / reconnecting / paused。
+
+### Step 9：再扩展 native capabilities
+
+只按真实需求增加。
+
+---
+
+## 22. 最小测试矩阵
+
+### 连接
+
+- [ ] 首次配对成功；
+- [ ] token 错误时拒绝连接；
+- [ ] Wi-Fi → 5G 后自动重连；
+- [ ] server 重启后客户端自动恢复；
+- [ ] pause 后不再连接；
+- [ ] resume 后重新上线。
+
+### 读取
+
+- [ ] status 返回前台 package；
+- [ ] ui_tree 不返回密码文本；
+- [ ] screenshot 正常；
+- [ ] App 自绘界面时 screenshot 仍可用。
+
+### 操作
+
+- [ ] tap；
+- [ ] swipe；
+- [ ] back；
+- [ ] home；
+- [ ] open_app；
+- [ ] 普通输入框 type；
+- [ ] password field type 被拒绝。
+
+### Bridge
+
+- [ ] command id 唯一；
+- [ ] timeout 会清理 pending；
+- [ ] 设备断线时 pending 立即失败；
+- [ ] 多设备时 device_id 路由正确。
+
+### 敏感能力
+
+- [ ] 未授权时明确失败；
+- [ ] 授权后只开放对应 capability；
+- [ ] 撤销权限后正确降级；
+- [ ] 日志脱敏在手机端生效。
+
+---
+
+## 23. 常见问题
+
+### Q1：必须用 MCP 吗？
+
+不必须。
+
+`DeviceHub` 上面可以接：
+
+- MCP；
+- REST；
+- CLI；
+- Web UI；
+- 自己的 agent protocol。
+
+MCP 只是当前 personal AI 场景里比较方便的一层。
+
+### Q2：必须用 AccessibilityService 吗？
+
+如果只需要：
+
+- 通知；
+- 蓝牙；
+- 传感器；
+- 文件；
+- 麦克风；
+
+未必需要。
+
+如果需要跨 App 的 UI inspection / tap / swipe，它比较合适。
+
+### Q3：为什么不用 ADB 常驻？
+
+ADB 适合开发，但长期 companion 使用体验不稳定，也不自然。
+
+更好的结构是：
+
+```text
+ADB = bootstrap / debug
+Android App = runtime
+```
+
+### Q4：为什么不用自动化框架直接跑在电脑？
+
+可以，但那会让“手机是否在线、网络是否切换、USB 是否连着”变成额外依赖。
+
+常驻 Android companion 更适合作为长期设备能力层。
+
+### Q5：一定要 VPS 吗？
+
+不一定。
+
+只要中间层能被：
+
+- Android App 访问；
+- AI / MCP 访问；
+
+即可。
+
+可以是：
+
+- VPS；
+- 家中服务器；
+- Tailscale 内网服务；
+- cloud function + persistent WebSocket backend；
+- 其他稳定 endpoint。
+
+---
+
+## 24. 公开版与生产版建议分开
+
+如果你准备把自己的实现公开，建议保留：
+
+- protocol；
+- capability interface；
+- example MCP tools；
+- pairing flow；
+- security model；
+- test strategy。
+
+保持私有：
+
+- token；
+- endpoint；
+- 设备 ID；
+- 真实账号信息；
 - 私人 prompt；
-- 完整 CatTea / Home adapter 源码；
-- 可以直接连接我们设备的配置。
+- 生产 adapter 的敏感部分；
+- signing key；
+- runtime logs；
+- artifact store 内容。
 
-但教程里的核心架构、能力分层和安全边界，都来自实际长期运行与迭代中的 Umi Mobile。
+不要为了做教程把生产仓库本身改成 public。
 
-如果以后我们整理出足够独立、维护成本也合适的模块，可能会再单独公开 reference implementation。
+---
+
+## 25. 一个最小可行版本
+
+如果只想验证这个方案，第一版做到这些就够：
+
+```text
+Android:
+- AccessibilityService
+- BridgeClient
+- ConfigStore
+
+Server:
+- WebSocketServer
+- DeviceHub
+- phone_status
+- phone_ui_tree
+- phone_screenshot
+- phone_tap
+- phone_swipe
+
+Security:
+- WSS
+- device token
+- owner pause switch
+- password redaction
+- command timeout
+```
+
+这已经足够形成一个真正可用的 AI ↔ Android 闭环。
+
+后续能力应该按实际需求继续扩展，而不是一次性设计一个“万能手机 agent”。
 
 ---
 
