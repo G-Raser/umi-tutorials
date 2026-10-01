@@ -14,6 +14,9 @@
 - [ChatGPT 多窗口 Bridge：会话隔离、Listener 接管与顺序投递](tutorials/chatgpt-multi-window-bridge/README.md)  
   略过基础 Bridge 搭建，重点整理多窗口长期使用后真正需要处理的 session / binding 隔离、listener 接管、同会话顺序、跨会话并行和回复持久化。
 
+- [从 MCP 到 Android：搭建一个受控的 AI 手机 Bridge](tutorials/umi-mobile-ai-companion-bridge/README.md)  
+  基于 Umi Mobile 的实际实现，整理 Android companion、WSS 设备通道、DeviceHub、MCP 工具层、AccessibilityService、配对、安全边界、测试与可选原生能力扩展。
+
 更多 Umi / CatTea 工具教程以后按实际完成情况逐步加入。
 
 ## Repository structure
@@ -25,6 +28,8 @@ umi-tutorials/
     ├── chatgpt-thinking-card/
     │   └── README.md
     ├── chatgpt-multi-window-bridge/
+    │   └── README.md
+    ├── umi-mobile-ai-companion-bridge/
     │   └── README.md
     └── ...
 ```
