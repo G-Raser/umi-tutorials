@@ -114,7 +114,11 @@ phone transcript → Bridge ───┘
 voice → ASR → API model → TTS
 ```
 
-这里的结构多了一层官方宿主。当前实测主路径中，Bridge claim 到电话请求后，通过 `sendFollowUpMessage` 把最终 transcript 作为当前绑定 conversation 的一个 follow-up turn 提交进去：
+这里的结构多了一层官方宿主。Bridge claim 到电话请求后，需要通过**当前宿主实际可用的消息入口**把最终 transcript 提交进绑定 conversation。
+
+我们早期实测过 `ui/message` 可以直接工作；近期实际使用中，这条路径经常失败，现有实现会继续 fallback 到 `sendFollowUpMessage`，所以最近的大多数电话 turn 实际落在 follow-up 路径上。这个行为属于 ChatGPT / Work 的宿主产品层，可能随客户端版本、宿主能力暴露或灰度更新发生变化，不适合把某一个接口永久写死。
+
+推荐把这一层理解成：
 
 ```text
 voice
@@ -127,7 +131,9 @@ Bridge queue
   ↓
 listener claims request
   ↓
-sendFollowUpMessage
+host message submit
+  ├─ ui/message when available
+  └─ sendFollowUpMessage fallback / current frequent path
   ↓
 bound official ChatGPT conversation
   ↓
@@ -140,7 +146,9 @@ local call ledger
 TTS
 ```
 
-这里的 follow-up message 仍然进入原来的官方 conversation，因此它继续使用这段会话已经存在的上下文、模型环境和工具状态。
+无论实际走哪一个宿主消息入口，目标都一样：把这一轮送进原来的官方 conversation，因此继续使用这段会话已经存在的上下文、模型环境和工具状态。
+
+实现时应先做 capability detection，再选择当前可用的 host message path；如果首选路径失败，fallback 应继续复用同一个 `request_id` 和 binding，不要因此创建第二个业务 turn。最好同时记录实际使用的 `host_message_path` 和经过清理的 `fallback_reason`，这样产品层行为变化时可以直接从日志判断发生了什么。
 
 ### 2.1 session 和 binding 一一对应更稳
 
@@ -184,7 +192,7 @@ heartbeat
   ↓
 claim pending request
   ↓
-send follow-up message to official host
+submit through an available host message path
   ↓
 wait for callback
 ```
@@ -231,9 +239,9 @@ client creates request
   ↓ queued
 Bridge listener claims
   ↓ claimed
-listener starts follow-up submit
+listener starts host message submit
   ↓ host_submit_started
-sendFollowUpMessage returns
+selected host message API returns
   ↓ host_submission_returned
 request marked sent
   ↓ dispatched
@@ -243,6 +251,16 @@ official model calls callback
 
 这些阶段最好写进持久化 request ledger。服务重启之后仍能知道请求进行到哪里。
 
+如果宿主消息入口存在 fallback，再额外记录：
+
+```text
+host_message_path
+fallback_from
+fallback_reason
+```
+
+这样以后遇到“以前能走、最近突然只能 fallback”的产品层变化，不需要靠肉眼回忆当时卡片里显示了什么。
+
 ### 3.1 authoritative reply 应来自 callback
 
 不要依赖读取官方页面上“最新一条 assistant bubble”。
@@ -250,7 +268,7 @@ official model calls callback
 更稳的协议是：
 
 ```text
-official model receives request_id in the follow-up turn
+official model receives request_id in the submitted turn
   ↓
 forms the answer using current official conversation context
   ↓
@@ -641,7 +659,7 @@ AND call_id belongs to the active call
 AND request_id is new / idempotently reusable
 ```
 
-然后才进入 Bridge queue。当前实测主路径里，listener claim 到这条 request 后，会用 `sendFollowUpMessage` 把修正后的 transcript 作为当前官端 conversation 的一个 follow-up turn 提交。
+然后才进入 Bridge queue。listener claim 到这条 request 后，通过当前宿主可用的消息入口把修正后的 transcript 提交到绑定 conversation。早期实测 `ui/message` 可以工作；近期实际使用中经常触发 fallback，因此现在大量电话 turn 最终走 `sendFollowUpMessage`。这层应按实时 capability 和实际宿主行为决定，不要把某一个产品接口视为永远固定。
 
 原始语音附件仍保存在本地 ledger，官端只需要收到最终可读文本时，就没有必要把音频文件本身再次上传给官方模型。
 
@@ -727,7 +745,7 @@ submit B
 
 ## 11. 同一条官端回复里，把显示文本和 TTS 文本分层
 
-`sendFollowUpMessage` 提交的是当前 conversation 的一个 follow-up turn。官端模型针对这一轮只需要完成一次回答，并在同一轮里调用一次：
+无论这一轮具体通过 `ui/message`、`sendFollowUpMessage`，还是后续产品层暴露出的等价宿主消息入口提交，官端模型针对这个 bridge request 都只需要完成一次回答，并在同一轮里调用一次：
 
 ```text
 deliver_reply(request_id, reply_text)
@@ -945,7 +963,7 @@ speech end
    ├─ transcript review
    ├─ Bridge queue
    ├─ listener claim
-   ├─ sendFollowUpMessage
+   ├─ host message submit
    ├─ official model generation
    ├─ deliver_reply callback
    ├─ first TTS
@@ -958,6 +976,7 @@ speech end
 
 - Bridge queue 等待；
 - listener claim；
+- host message path fallback；
 - official host composer 暂时不可用；
 - 官端模型生成；
 - reply callback 落账；
@@ -1216,6 +1235,7 @@ restore the same call
    - request_id
    - authoritative reply callback
    - idempotent reply
+   - host message capability detection / fallback
 
 2. getUserMedia / native mic 能稳定拿 PCM
 
@@ -1228,7 +1248,7 @@ restore the same call
 
 5. personal vocabulary + transcript review 跑通
 
-6. transcript 能作为 call_mode follow-up turn 进入原官方 conversation
+6. transcript 能作为 call_mode host turn 进入原官方 conversation
 
 7. authoritative reply 能回本地 ledger
 
@@ -1259,7 +1279,8 @@ Bridge + VAD + ASR + official host + TTS + background + UI
 
 ```text
 [ ] 一个 local session 只进入绑定的官方 conversation
-[ ] 电话 transcript 作为 follow-up turn 进入当前绑定的官方 conversation
+[ ] 电话 transcript 能通过当前宿主可用的消息入口进入绑定 conversation
+[ ] host message path fallback 时仍复用同一个 request_id / binding
 [ ] 两个独立 binding 可以并行，不抢 request
 [ ] listener 断开后可以明确发现并恢复
 [ ] 同 request_id 的重复 callback 不会重复落账
