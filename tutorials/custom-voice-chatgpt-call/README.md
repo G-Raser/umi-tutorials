@@ -114,7 +114,7 @@ phone transcript → Bridge ───┘
 voice → ASR → API model → TTS
 ```
 
-这里的结构多了一层官方宿主：
+这里的结构多了一层官方宿主。当前实测主路径中，Bridge claim 到电话请求后，通过 `sendFollowUpMessage` 把最终 transcript 作为当前绑定 conversation 的一个 follow-up turn 提交进去：
 
 ```text
 voice
@@ -125,16 +125,22 @@ local call request
   ↓
 Bridge queue
   ↓
-listener in the bound official ChatGPT conversation
+listener claims request
   ↓
-official model produces reply
+sendFollowUpMessage
   ↓
-reply callback with the same request_id
+bound official ChatGPT conversation
+  ↓
+official model produces one reply for this turn
+  ↓
+deliver_reply with the same request_id
   ↓
 local call ledger
   ↓
 TTS
 ```
+
+这里的 follow-up message 仍然进入原来的官方 conversation，因此它继续使用这段会话已经存在的上下文、模型环境和工具状态。
 
 ### 2.1 session 和 binding 一一对应更稳
 
@@ -178,7 +184,7 @@ heartbeat
   ↓
 claim pending request
   ↓
-submit to official host
+send follow-up message to official host
   ↓
 wait for callback
 ```
@@ -225,9 +231,9 @@ client creates request
   ↓ queued
 Bridge listener claims
   ↓ claimed
-listener starts host submit
+listener starts follow-up submit
   ↓ host_submit_started
-host API / ui message returns
+sendFollowUpMessage returns
   ↓ host_submission_returned
 request marked sent
   ↓ dispatched
@@ -244,7 +250,7 @@ official model calls callback
 更稳的协议是：
 
 ```text
-official model receives request_id
+official model receives request_id in the follow-up turn
   ↓
 forms the answer using current official conversation context
   ↓
@@ -635,7 +641,7 @@ AND call_id belongs to the active call
 AND request_id is new / idempotently reusable
 ```
 
-然后才进入 Bridge queue。
+然后才进入 Bridge queue。当前实测主路径里，listener claim 到这条 request 后，会用 `sendFollowUpMessage` 把修正后的 transcript 作为当前官端 conversation 的一个 follow-up turn 提交。
 
 原始语音附件仍保存在本地 ledger，官端只需要收到最终可读文本时，就没有必要把音频文件本身再次上传给官方模型。
 
@@ -719,14 +725,22 @@ submit B
 
 ---
 
-## 11. 官端回复和“真正要念出来的文字”最好分开
+## 11. 同一条官端回复里，把显示文本和 TTS 文本分层
 
-电话回复经常需要两套文本：
+`sendFollowUpMessage` 提交的是当前 conversation 的一个 follow-up turn。官端模型针对这一轮只需要完成一次回答，并在同一轮里调用一次：
 
 ```text
-visible reply      → 字幕 / 对话历史
-speech segment     → TTS 输入
+deliver_reply(request_id, reply_text)
 ```
+
+这里不存在“先产生一条普通官方回复，再另外产生一条给 TTS 的回复”。需要分层的是**同一个 authoritative `reply_text` 内部的数据**：
+
+```text
+visible text       → 本地字幕 / 对话历史
+speech block       → TTS 输入
+```
+
+这里的 `visible text` 指的是 `reply_text` 里要写入本地 ledger 和电话字幕的正文，不是第二条官端 message。
 
 尤其当 TTS 支持 performance tags 时：
 
@@ -736,9 +750,9 @@ speech segment     → TTS 输入
 [whispers]
 ```
 
-这些标签适合送进声线模型，却不一定适合显示在聊天正文里。
+这些标签适合送进声线模型，却不适合混进可见正文。
 
-可以让官端 reply 使用一个很小的 speech envelope：
+可以让一次 `reply_text` 使用一个很小的 speech envelope：
 
 ```text
 visible assistant reply
@@ -748,18 +762,18 @@ visible assistant reply
 <<<END_SPEECH>>>
 ```
 
-Bridge 后端接到 authoritative `reply_text` 后：
+Bridge 后端收到这一次 authoritative `reply_text` 后：
 
 ```text
 parse visible text
 parse speech blocks
-persist visible reply
+persist visible text
 send speech blocks to TTS
 ```
 
-如果没有 speech block，可以按规则从短 reply 自动回退生成 TTS 文本。
+如果没有 speech block，也可以直接从 visible text 生成 TTS 输入。
 
-关键点是：**performance tags 只进入音频文本层，字幕层先清理掉。**
+关键点是：**官端只有这一轮回复；显示层和语音层是在回调 payload 内部分层。performance tags 只进入音频文本层。**
 
 ---
 
@@ -770,7 +784,7 @@ send speech blocks to TTS
 推荐：
 
 ```text
-authoritative assistant reply
+single authoritative reply_text
   ↓
 speech segments
   ↓
@@ -931,9 +945,9 @@ speech end
    ├─ transcript review
    ├─ Bridge queue
    ├─ listener claim
-   ├─ official host submit
+   ├─ sendFollowUpMessage
    ├─ official model generation
-   ├─ reply callback
+   ├─ deliver_reply callback
    ├─ first TTS
    └─ playback start
 ```
@@ -1214,7 +1228,7 @@ restore the same call
 
 5. personal vocabulary + transcript review 跑通
 
-6. transcript 能作为 call_mode request 进入原官方 conversation
+6. transcript 能作为 call_mode follow-up turn 进入原官方 conversation
 
 7. authoritative reply 能回本地 ledger
 
@@ -1245,6 +1259,7 @@ Bridge + VAD + ASR + official host + TTS + background + UI
 
 ```text
 [ ] 一个 local session 只进入绑定的官方 conversation
+[ ] 电话 transcript 作为 follow-up turn 进入当前绑定的官方 conversation
 [ ] 两个独立 binding 可以并行，不抢 request
 [ ] listener 断开后可以明确发现并恢复
 [ ] 同 request_id 的重复 callback 不会重复落账
