@@ -14,6 +14,9 @@
 - [ChatGPT 多窗口 Bridge：会话隔离、Listener 接管与顺序投递](tutorials/chatgpt-multi-window-bridge/README.md)  
   略过基础 Bridge 搭建，重点整理多窗口长期使用后真正需要处理的 session / binding 隔离、listener 接管、同会话顺序、跨会话并行和回复持久化。
 
+- [自定义声线 AI 电话：连续收音、转写、会话投递与 TTS 回放](tutorials/custom-voice-ai-call/README.md)  
+  只讲关键工程通路：连续收音与 VAD、异步 ASR、沿用已有会话上下文、自定义声线 TTS、有序渐进播放、状态恢复和延迟测量。
+
 更多 Umi / CatTea 工具教程以后按实际完成情况逐步加入。
 
 ## Repository structure
@@ -25,6 +28,8 @@ umi-tutorials/
     ├── chatgpt-thinking-card/
     │   └── README.md
     ├── chatgpt-multi-window-bridge/
+    │   └── README.md
+    ├── custom-voice-ai-call/
     │   └── README.md
     └── ...
 ```
