@@ -1,64 +1,293 @@
-# 自定义声线 AI 电话：连续收音、转写、会话投递与 TTS 回放
+# 给官端 ChatGPT 接上自己的声音：Bridge、语音识别与自定义声线电话
 
 **Umi & CatTea**
 
-> 这篇只讲一条可以实际落地的技术通路：**麦克风连续收音 → 自动分段 → ASR 转写 → 投递到已有 AI 会话 → 拿回文字回复 → 自定义声线 TTS → 顺序播放。**
->
-> 不讨论具体角色设定、UI 视觉、私人 prompt 或某个生产环境的部署细节。
->
-> 默认你已经有一个能工作的文本聊天入口，以及一个可以根据文本返回音频的 TTS 服务。ASR、LLM 和 TTS 都可以替换供应商。
+这篇教程解决一个比较窄、但很具体的问题：
 
----
+> **让一个已经存在的官方 ChatGPT Chat / Work 会话，通过外部电话界面接收语音输入，并使用自定义声线把这个官方会话的回复播放回来。**
 
-## 1. 先把“电话”理解成现有会话的语音外壳
-
-最重要的一条原则是：
-
-> **不要为了做电话，再单独造一套聊天上下文。**
-
-电话最好只是现有 session 的另一种输入 / 输出方式。
+目标链路是：
 
 ```text
 Microphone
-   ↓
-VAD / segmentation
-   ↓
-Audio attachment
-   ↓
-ASR
-   ↓
-existing conversation/session
-   ↓
-assistant text reply
-   ↓
-custom TTS
-   ↓
-ordered audio playback
+  ↓
+continuous capture / VAD
+  ↓
+voice attachment
+  ↓
+ASR + personal vocabulary
+  ↓
+reviewable transcript
+  ↓
+Call request
+  ↓
+ChatGPT Bridge
+  ↓
+bound official ChatGPT Chat / Work conversation
+  ↓
+authoritative reply callback
+  ↓
+custom-voice TTS
+  ↓
+ordered progressive playback
 ```
 
-文本输入和电话输入最后应该进入同一个会话：
+这里的关键约束是：**真正回答电话的模型仍然位于原来的官方 ChatGPT 会话里。** 电话前端不会另开一套 API-only 对话，也不会复制一份 prompt 去模拟那个会话。
 
-```text
-typed message ─┐
-               ├─→ same session / same context / same memory
-voice segment ─┘
-```
+如果你的目标只是做一个普通实时 LLM 语音助手，现成的 Realtime API、WebRTC Agent 或开源 voice-agent 栈通常会更直接。这篇主要讨论“已有官方 ChatGPT 会话 + 外部 Bridge + 自定义声线”这一条通路。
 
-这样电话天然继承：
+本文重点包括：
 
-- 已有聊天历史；
-- system prompt / memory；
-- 原模型路由；
-- session 持久化；
-- 原来的回复同步逻辑。
+- 如何把电话输入送进指定的官方 ChatGPT 会话；
+- Bridge 的 binding、listener、request lifecycle 和 authoritative callback；
+- 连续收音、VAD、pre-roll 和噪声端点判断；
+- 主人侧语音识别、专属词表和转写纠错；
+- `session_id / call_id / request_id` 的归属关系；
+- 自定义声线 TTS 的渐进生成与有序播放；
+- 后台 / 锁屏 carrier；
+- 实际长期运行中遇到的故障和延迟定位方法。
 
-电话层只负责音频 I/O 和 turn 生命周期，不重新发明聊天系统。
+本文不包含私人 prompt、真实声线 ID、真实密钥、内部域名或完整生产源码。
 
 ---
 
-## 2. 第一层：连续收音 + 本地 VAD 自动切句
+## 1. 核心架构：电话只是官方会话的一条新 I/O 通路
 
-浏览器前台版本可以直接用：
+整套系统最好先拆成四层：
+
+```text
+┌──────────────────────────────┐
+│  Audio frontend / native app │
+│  mic · VAD · playback        │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Voice pipeline              │
+│  attachment · ASR · review   │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  ChatGPT Bridge              │
+│  binding · queue · listener  │
+│  callback · idempotency      │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Official ChatGPT Chat/Work  │
+│  existing context & tools    │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Voice output                │
+│  reply parsing · custom TTS  │
+│  progressive ordered play    │
+└──────────────────────────────┘
+```
+
+文本输入和电话输入最终进入同一个官方 conversation：
+
+```text
+typed message ───────────────┐
+                             ├─→ bound official conversation
+phone transcript → Bridge ───┘
+```
+
+这样电话可以继续使用原会话已经拥有的：
+
+- 对话历史；
+- Instructions / system context；
+- 官方窗口里的模型选择；
+- 当前插件 / 工具环境；
+- 已经形成的 conversation continuity。
+
+电话层主要新增音频输入输出、Bridge transport 和 call lifecycle。
+
+---
+
+## 2. Bridge 是这套电话的中心 transport
+
+普通 LLM 电话常见结构是：
+
+```text
+voice → ASR → API model → TTS
+```
+
+这里的结构多了一层官方宿主：
+
+```text
+voice
+  ↓
+ASR
+  ↓
+local call request
+  ↓
+Bridge queue
+  ↓
+listener in the bound official ChatGPT conversation
+  ↓
+official model produces reply
+  ↓
+reply callback with the same request_id
+  ↓
+local call ledger
+  ↓
+TTS
+```
+
+### 2.1 session 和 binding 一一对应更稳
+
+一个长期使用的本地 session 最好绑定到一个明确的官方 Chat / Work conversation：
+
+```text
+local session
+  └─ binding_id
+       └─ official ChatGPT conversation
+```
+
+不要让两个官方窗口同时拿同一个专属 binding。否则两个 listener 可能竞争同一条 lane，造成：
+
+- A 窗抢走本应进入 B 窗的请求；
+- reply 回到错误 conversation；
+- listener heartbeat 状态互相覆盖；
+- 调试时看起来像随机丢消息。
+
+如果需要多窗口并存，每个窗口使用独立 binding。
+
+### 2.2 listener 需要 lease / heartbeat
+
+Bridge 不能假设官方页面永远活着。移动端、后台标签页或浏览器节流都可能让 listener 停止轮询。
+
+建议至少维护：
+
+```text
+binding_id
+listener_token
+listener_revision
+listener_build
+last_heartbeat_at
+```
+
+典型流程：
+
+```text
+open / reconnect listener
+  ↓
+heartbeat
+  ↓
+claim pending request
+  ↓
+submit to official host
+  ↓
+wait for callback
+```
+
+后台标签页可能降低 timer 频率，所以 listener stale 判定不要设得过于激进。
+
+### 2.3 电话模式可以进入 fast polling
+
+普通聊天不需要高频轮询；电话对首字延迟更敏感。
+
+可以在 listener 发现 `call_mode=true` 后暂时切到短间隔：
+
+```text
+normal idle polling
+      ↓ call request arrives
+fast polling / warm window
+      ↓ call becomes idle
+normal polling
+```
+
+这样无需把所有普通 Bridge 请求永久跑在高频模式。
+
+---
+
+## 3. Bridge request 要有明确生命周期
+
+电话延迟和故障很难只靠一个 `pending=true` 排查。
+
+推荐至少记录：
+
+```text
+queued
+claimed
+host_submit_started
+host_submission_returned
+dispatched
+replied
+```
+
+例如：
+
+```text
+PWA creates request
+  ↓ queued
+Bridge listener claims
+  ↓ claimed
+listener starts host submit
+  ↓ host_submit_started
+host API / ui message returns
+  ↓ host_submission_returned
+request marked sent
+  ↓ dispatched
+official model calls callback
+  ↓ replied
+```
+
+这些阶段最好写进持久化 request ledger。服务重启之后仍能知道请求进行到哪里。
+
+### 3.1 authoritative reply 应来自 callback
+
+不要依赖读取官方页面上“最新一条 assistant bubble”。
+
+更稳的协议是：
+
+```text
+official model receives request_id
+  ↓
+forms the answer using current official conversation context
+  ↓
+calls something like:
+
+deliver_reply(request_id, reply_text)
+```
+
+本地后端把这次 callback 当作 authoritative reply。
+
+这样可以避免：
+
+- 官方 UI bubble 渲染变化；
+- 读到别的手动消息；
+- DOM 结构更新后 scraper 失效；
+- 同一窗口并发 turn 时错配回复。
+
+### 3.2 callback 必须幂等
+
+同一个 `request_id` 只能接受一个 authoritative reply。
+
+```text
+first valid callback  → accepted
+same callback again   → return existing accepted state
+unknown request       → reject
+expired invalid state → reject
+```
+
+不要因为重试产生两条 assistant reply 或两段重复 TTS。
+
+### 3.3 Bridge 失败时不要静默切换模型来源
+
+这一类电话的核心条件是“回答来自绑定的官方 ChatGPT conversation”。
+
+因此 Bridge listener 断开、claim 失败或 official host 投递失败时，应显示 transport failure 并等待恢复。静默改走普通 API 会让电话继续有声音，却失去原官方 conversation 的上下文和宿主身份。
+
+---
+
+## 4. 连续收音：VAD 要同时解决开头、结尾和噪声
+
+浏览器前台版本可以从：
 
 ```js
 navigator.mediaDevices.getUserMedia({
@@ -71,18 +300,18 @@ navigator.mediaDevices.getUserMedia({
 })
 ```
 
-再接一个 `AudioContext` 读取单声道 PCM。
+开始，再使用 `AudioContext` 读取单声道 PCM。
 
-最小 VAD 不一定要先引入复杂模型。对个人工具，能工作的第一版可以用：
+一个简单的能量 VAD 可以先看 frame RMS：
 
 ```text
 frame RMS
   ↓
-和动态 noise floor 比较
+compare with dynamic noise floor
   ↓
-连续若干帧超过 threshold → speech start
+continuous voiced frames → speech start
   ↓
-持续静音一段时间 → speech end
+sustained silence → speech end
 ```
 
 示意：
@@ -98,18 +327,20 @@ function processFrame(samples, now) {
     samples.reduce((sum, x) => sum + x * x, 0) / samples.length
   );
 
-  const threshold = Math.max(0.018, noiseFloor * 2.9);
+  const startThreshold = Math.max(0.018, noiseFloor * 2.9);
+  const keepThreshold = startThreshold * 0.65;
 
   if (speechActive) {
     capture(samples);
-    if (rms > threshold * 0.65) lastSpeechAt = now;
+    if (rms > keepThreshold) lastSpeechAt = now;
     if (now - lastSpeechAt > SILENCE_END_MS) finalizeSegment();
+    if (segmentDuration() > HARD_MAX_SEGMENT_MS) finalizeSegment();
     return;
   }
 
   keepPreRoll(samples);
 
-  if (rms > threshold) {
+  if (rms > startThreshold) {
     voicedFrames += 1;
     if (voicedFrames >= 2) beginSegment(now);
   } else {
@@ -119,39 +350,55 @@ function processFrame(samples, now) {
 }
 ```
 
-### 为什么需要 pre-roll
+这里最好同时有：
 
-如果只在检测到 speech 后才开始存 PCM，开头几个音节很容易被切掉。
+- dynamic noise floor；
+- speech start / keep 两个不同门槛，避免边界抖动；
+- silence endpoint；
+- hard max segment duration。
 
-因此建议一直保留最近约几百毫秒的输入：
+### 4.1 pre-roll 防止句首被吃掉
+
+如果检测到 speech 才开始保存 PCM，句首很容易缺半个词。
+
+保留最近几百毫秒：
 
 ```text
 ... silence ... [pre-roll buffer] speech begins
                          ↑
-                  segment 从这里开始
+                  segment starts here
 ```
 
-### 不要把所有声音都送去 ASR
+检测到人声时，把 pre-roll 一起写进当前 segment。
 
-至少过滤：
+### 4.2 hard max duration 很重要
 
-- 极短 bump；
-- 单次碰撞声；
-- 很短的背景噪音；
-- 明显低于有效语音时长的片段。
+真实环境里持续风声、交通声、空调声甚至直升机声都可能让 VAD 一直认为“还有声音”。
 
-否则会白白增加 STT 请求和误识别。
+只靠 silence endpoint 可能出现：
+
+```text
+主人已经说完
+↓
+背景噪声仍高于 keep threshold
+↓
+segment 永远不 finalize
+↓
+ASR 永远没有机会开始
+```
+
+所以需要最大单段时长作为最后保险。
 
 ---
 
-## 3. PCM 最简单可以封成单声道 WAV
+## 5. PCM 可以封成单声道 WAV 再送 ASR
 
-如果前端已经拿到 Float32 PCM，可以直接构造 16-bit PCM WAV。
+如果前端已经拿到 Float32 PCM，可以转换成 PCM16 WAV：
 
 ```text
 RIFF header
 WAVE
-fmt  chunk
+fmt chunk
 mono / PCM16
 sample rate = AudioContext.sampleRate
 data chunk
@@ -165,40 +412,40 @@ function pcmToWav(frames, sampleRate) {
   const buffer = new ArrayBuffer(44 + sampleCount * 2);
   const view = new DataView(buffer);
 
-  // write RIFF/WAVE header...
-  // write each float sample as int16...
+  // write RIFF/WAVE header
+  // float [-1,1] → signed int16
 
   return new Blob([buffer], { type: 'audio/wav' });
 }
 ```
 
-这样有几个好处：
+WAV 的优势主要在调试：
 
-- 后端解码简单；
-- Whisper 类 ASR 普遍支持；
-- 调试时可以直接保存播放；
-- 不依赖浏览器 `MediaRecorder` 的容器差异。
+- MIME 和真实容器更容易保持一致；
+- 后端无需猜浏览器录音容器；
+- 原始 segment 可以直接保存并回放；
+- Whisper 类 ASR 普遍支持。
 
-如果你已经有稳定的 WebM / Ogg / M4A 上传链，也可以继续用，不必强制转 WAV。
+如果现有 WebM / Ogg / M4A 链已经稳定，也可以继续沿用。
 
 ---
 
-## 4. 语音上传和 ASR 最好拆成“附件状态机”
+## 6. 语音先成为 durable attachment，再开始 ASR
 
-不要让一次 HTTP 请求一直卡着等 ASR 完成。
+电话转写不要和一次前端 HTTP 请求绑死。
 
-更稳的结构是：
+更稳的状态机：
 
 ```text
 POST audio
   ↓
-server saves original audio
+server persists original bytes
   ↓
-return attachment_id + status=transcribing
+return attachment_id + transcribing
   ↓
 background ASR
   ↓
-status=ready / failed
+ready / failed
 ```
 
 例如：
@@ -214,13 +461,13 @@ status=ready / failed
 }
 ```
 
-前端再轮询：
+前端轮询：
 
 ```http
 GET /api/voice-attachments/{id}
 ```
 
-直到：
+完成后：
 
 ```json
 {
@@ -229,19 +476,15 @@ GET /api/voice-attachments/{id}
 }
 ```
 
-### 为什么值得多这一层
+持久化原音频的好处包括：
 
-因为 ASR 不是一个稳定的瞬时操作。
+- 页面刷新后仍可恢复；
+- ASR 失败可重试；
+- 用户可以回听原音；
+- transcript 可以修改，同时保留原识别结果；
+- 后续可以重新跑更好的识别模型。
 
-把音频先持久化，再异步转写，可以处理：
-
-- 网络重试；
-- 页面刷新；
-- ASR 暂时失败；
-- 手动修改转写；
-- 后续重新分析原录音。
-
-最小状态可以只有：
+最小状态：
 
 ```text
 transcribing
@@ -251,50 +494,163 @@ failed
 
 ---
 
-## 5. 把“转写后的文本”送进原会话
+## 7. 电话 ASR 要有“专属词表 + 可人工修正”
 
-如果你的 LLM / Bridge 本身已经是文本通路，最简单的做法不是硬把原始音频塞给模型，而是：
+连续电话里，ASR 错一个词的后果比普通语音备忘录更大，因为错误文本会直接进入当前官方 conversation。
 
-1. 保存原始语音附件；
-2. ASR 得到 transcript；
-3. 把 transcript 作为本轮 owner/user message；
-4. 在本地 message metadata 里保留原语音附件。
+长期使用后最明显的错误包括：
+
+- 高频口语被替换成发音相近的普通词；
+- 专有名词、昵称、产品名和缩写识别不稳定；
+- 中英混说时局部语言切错；
+- 中文句子突然混入韩文等其他脚本；
+- 环境噪声被“听”成一句不存在的话。
+
+真实测试里就遇到过类似：
+
+```text
+“笑死” → “小子”
+中文口语 → 局部韩文污染
+持续环境声 → 奇怪的短词 / 短句
+```
+
+### 7.1 ASR prompt / vocabulary 很值得保留
+
+维护一个小型 personal vocabulary：
+
+```text
+猫茶
+Mommy
+小皇冠
+MCP
+raw tags
+Umi Toy
+笑死
+咱
+...
+```
+
+把这些词作为 ASR hint / prompt，而非在识别结束后无条件字符串替换。
+
+### 7.2 实时电话里，第二轮 LLM 自动纠错要谨慎
+
+一种常见方案是：
+
+```text
+ASR transcript
+  ↓
+LLM vocabulary correction
+  ↓
+final transcript
+```
+
+普通语音消息里这有时很好用；实时电话里它会增加：
+
+- 一次额外模型请求；
+- 首轮延迟；
+- “纠错模型”擅自改写原意的风险。
+
+我们当前电话模式的策略是：
+
+```text
+ASR 仍使用 vocabulary prompt
+call_mode 下跳过第二轮 LLM correction
+```
+
+也就是：
+
+```python
+transcribe(
+    audio,
+    vocabulary=personal_vocabulary,
+    second_pass_correction=False,
+)
+```
+
+普通 voice message 仍可以选择开启更慢的二次纠错。
+
+### 7.3 给 transcript 一个很短的 review window
+
+电话不适合要求用户每轮都点“确认”，但完全无审查也容易把明显错词送进官端。
+
+一种折中结构：
+
+```text
+ASR ready
+  ↓
+show transcript briefly
+  ├─ no action → auto-send
+  └─ tap / hold → pause auto-send and edit
+```
+
+编辑时只改当前 transcript：
 
 ```json
 {
-  "role": "user",
-  "content": "刚才那句话你听见了吗",
+  "raw_transcript": "小子，这个也太好笑了",
+  "transcript": "笑死，这个也太好笑了",
+  "transcript_edited": true
+}
+```
+
+原音频和 raw transcript 保留，最终进入模型的是修正后的 transcript。
+
+### 7.4 对明显异常结果可以保守一点
+
+可以增加轻量 guard，例如：
+
+- 录音极短但 transcript 很长；
+- 主语言长期为中文，某一轮突然大段陌生脚本；
+- ASR confidence 极低；
+- VAD 片段接近纯噪声；
+- transcript 只有一个和上下文无关的奇怪词。
+
+这类情况可以延长 review window 或要求一次手动发送，而不是直接进入 Bridge。
+
+---
+
+## 8. 把修正后的 transcript 送进原来的官方 conversation
+
+电话模式提交时，本地 request 可以长这样：
+
+```json
+{
+  "session_id": "session-001",
+  "transport": "chatgpt_bridge",
+  "call_mode": true,
   "call_id": "call-001",
   "request_id": "req-001",
+  "message": "刚才那句话你听见了吗",
   "attachments": [
-    {
-      "kind": "voice",
-      "id": "9e7c...",
-      "transcript": "刚才那句话你听见了吗"
-    }
+    { "id": "voice-attachment-id" }
   ]
 }
 ```
 
-这样模型收到的是干净文本，但本地仍然保留：
+后端需要确认：
 
-- 原音频；
-- 原转写；
-- 修正后的转写；
-- call / request 归属。
+```text
+session exists
+AND transport == chatgpt_bridge
+AND session is bound to one official Chat / Work conversation
+AND call_id belongs to the active call
+AND request_id is new / idempotently reusable
+```
 
-如果以后想把笑声、喘息、停顿等副语言信息也交给模型，可以在 ASR 后额外加一层本地音频分析，再把**有限、可解释的标签**合并进文本上下文；这不是电话 MVP 的必要条件。
+然后才进入 Bridge queue。
+
+原始语音附件仍保存在本地 ledger，官端只需要收到最终可读文本时，就没有必要把音频文件本身再次上传给官方模型。
 
 ---
 
-## 6. `call_id`、`request_id`、`session_id` 不要混在一起
+## 9. `session_id`、`call_id`、`request_id` 分工要固定
 
-最小电话系统建议至少保留三个 ID：
+至少保留三个 ID：
 
 ```text
-session_id  = 哪一段长期对话
+session_id  = 哪一段长期本地对话 / 对应哪个官方 conversation
 call_id     = 当前这一通电话
-request_id  = 电话里的某一次 user turn
+request_id  = 电话里的某一次 owner turn
 ```
 
 关系：
@@ -307,70 +663,127 @@ session-001
     └── request-c
 ```
 
-这样才能正确处理：
+它们分别解决：
 
-- 旧回复晚到；
-- 挂断后还有 TTS 在生成；
-- 新电话已经开始，旧电话的 reply 才回来；
-- 页面刷新后恢复当前 call；
-- 同一通电话里连续说多句。
+- `session_id`：长期上下文归属；
+- `call_id`：刷新恢复、挂断、后台 takeover；
+- `request_id`：单轮投递、回调、去重、TTS part 归属。
 
-最重要的是：**播放音频前必须确认 reply 仍属于当前 call + 当前 request。**
+所有 assistant reply part 在播放前都应核对：
+
+```text
+reply.session_id == current_session
+reply.call_id    == current_call
+reply.request_id == expected_request
+```
+
+否则旧电话的迟到回复很容易在新电话里突然播放。
 
 ---
 
-## 7. 同一通电话里，先保证“一个 turn 完整结束”
+## 10. 同一通电话里先限制一个 in-flight owner turn
 
-电话最容易出现的 bug 之一是：
+半实时电话最容易出现：
 
 ```text
-user turn A 还在等 reply
-user turn B 又已经提交
-assistant reply A / B 开始交叉
+turn A 已投递，正在等待官端
+turn B 又完成 ASR
+turn C 紧接着也完成
 ```
 
-第一版最好明确：
+第一版建议：
 
 ```text
-一个 session / call 同一时刻最多一条 in-flight user request
+one call → at most one in-flight owner request
 ```
 
-用户后面说的话可以先进入本地 queue：
+后续语音先放本地 queue：
 
 ```text
-captured segment B
-captured segment C
-        ↓
-      local queue
-        ↓
-A reply settled
-        ↓
+segment B
+segment C
+   ↓
+local turn queue
+   ↓
+A replied / failed definitively
+   ↓
 submit B
 ```
 
-这会牺牲一点极限实时感，但能显著降低乱序和上下文错位。
+这一点会牺牲少量全双工感，但能显著降低：
 
-后面再考虑更激进的 full-duplex / interruption。
+- reply 交叉；
+- 官端 context 顺序不确定；
+- TTS 乱序；
+- 用户自己连续说几句时的 request 对应问题。
+
+等 request lifecycle 和 barge-in 都稳定以后，再考虑多 in-flight turn。
 
 ---
 
-## 8. 自定义声线 TTS 放在后端，不要把 voice secret 放前端
+## 11. 官端回复和“真正要念出来的文字”最好分开
 
-拿到 assistant 文本后，后端再调用 TTS。
+电话回复经常需要两套文本：
 
 ```text
-assistant text
-   ↓
-TTS adapter / worker
-   ↓
-custom voice provider
-   ↓
-audio bytes
-   ↓
-local attachment
+visible reply      → 字幕 / 对话历史
+speech segment     → TTS 输入
 ```
 
-接口可以很简单：
+尤其当 TTS 支持 performance tags 时：
+
+```text
+[warmly]
+[short pause]
+[whispers]
+```
+
+这些标签适合送进声线模型，却不一定适合显示在聊天正文里。
+
+可以让官端 reply 使用一个很小的 speech envelope：
+
+```text
+visible assistant reply
+
+<<<SPEECH>>>
+[warmly] There you are. [short pause] I heard you.
+<<<END_SPEECH>>>
+```
+
+Bridge 后端接到 authoritative `reply_text` 后：
+
+```text
+parse visible text
+parse speech blocks
+persist visible reply
+send speech blocks to TTS
+```
+
+如果没有 speech block，可以按规则从短 reply 自动回退生成 TTS 文本。
+
+关键点是：**performance tags 只进入音频文本层，字幕层先清理掉。**
+
+---
+
+## 12. 自定义声线 TTS 放后端，并按 part 渐进生成
+
+不要把 voice ID / API key 放浏览器前端。
+
+推荐：
+
+```text
+authoritative assistant reply
+  ↓
+speech segments
+  ↓
+server-side TTS adapter / worker
+  ↓
+custom voice provider
+  ↓
+audio attachment
+```
+
+接口可以是：
 
 ```http
 POST /tts
@@ -380,63 +793,46 @@ Authorization: Bearer <server-side-token>
 
 ```json
 {
-  "text": "There you are. I heard you.",
+  "text": "[warmly] There you are.",
   "model_id": "your-model",
   "language_code": "en"
 }
 ```
 
-生产里建议：
+生产侧至少检查：
 
-- voice ID / API key 只放 Worker / server；
-- 前端只请求“为这段文本生成当前声线”；
-- 使用 POST，不把私人文本放 query string；
-- 校验返回的 `Content-Type` 必须是 `audio/*`；
-- 给单次音频设最大尺寸；
-- 给 TTS 请求设连接和生成 timeout。
+- TTS secret 只存在 server / worker；
+- 使用 POST；
+- 校验返回 `Content-Type: audio/*`；
+- 限制单次文本和音频大小；
+- 设置 connect / read timeout；
+- 失败 part 能单独标记并重试。
 
-如果使用 ElevenLabs、自建 voice worker 或其他克隆声线服务，这一层都可以保持同一个 adapter 接口。
+### 12.1 不要等整段 TTS 全部完成才开始播放
 
----
-
-## 9. TTS 不要等整段全部生成完再播放
-
-如果 assistant 一次回复几句，最直接的实现是：
+把回复按自然句段拆成：
 
 ```text
-full reply
-  ↓
-one long TTS request
-  ↓
-全部完成
-  ↓
-开始播放
+part 1
+part 2
+part 3
 ```
 
-这样首音延迟会很高。
-
-更实用的做法是按自然句段拆成少量 chunk：
+生成可以并发：
 
 ```text
-reply
-├── part 1
-├── part 2
-└── part 3
+TTS 1 ───── done
+TTS 2 ───────── done
+TTS 3 ───────────── done
 ```
 
-后台可以同时准备 1–2 段，但播放必须保持原顺序：
+播放严格有序：
 
 ```text
-TTS part 1 ─────── done ─→ play 1
-TTS part 2 ─────────── done ─→ play 2
-TTS part 3 ───────────────── done ─→ play 3
+play 1 → play 2 → play 3
 ```
 
-关键点：
-
-> **生成可以并发，播放必须有序。**
-
-每个 part 最好独立持久化：
+每个 part 记录：
 
 ```json
 {
@@ -448,22 +844,13 @@ TTS part 3 ───────────────── done ─→ play 
 }
 ```
 
-这样 part 1 好了就能先播，不必等待 part 2 / 3。
-
-如果服务中途重启，也只需要补还没完成的 part。
+只要连续 ready 的前缀出现，就可以开始播放第一段，无需等待最后一段。
 
 ---
 
-## 10. 前端播放队列要和“正在听用户说话”互斥
+## 13. 播放、VAD 和 barge-in 要互相知道对方状态
 
-一个安全的最小规则：
-
-```text
-如果用户正在说话 → 暂不播放新的 assistant 音频
-如果 assistant 正在播放 → VAD 仍要防止扬声器回声被当成人声
-```
-
-播放队列可以是：
+最小播放队列：
 
 ```js
 const playQueue = [];
@@ -477,42 +864,46 @@ function enqueue(parts) {
 function playNext() {
   if (speechActive || playing || playQueue.length === 0) return;
   playing = playQueue.shift();
-  // play audio, then clear and recurse
+  // play and then continue
 }
 ```
 
-### 回声和 barge-in
+### 13.1 模型自己的声音会被麦克风重新收进去
 
-手机扬声器播放 TTS 时，AEC 并不总能完全消掉回声。
-
-如果只看普通 VAD threshold，很容易发生：
+手机扬声器 + 麦克风很容易形成：
 
 ```text
-assistant 自己播放的声音
-→ 被 microphone 收到
-→ VAD 认为用户开始说话
-→ 自己打断自己
+TTS playback
+  ↓
+microphone captures speaker output
+  ↓
+VAD sees voice energy
+  ↓
+phone thinks owner interrupted
 ```
 
-更稳的做法是：
+浏览器的 AEC 不一定足够。
 
-- 播放刚开始的几百毫秒先建立 echo baseline；
-- 播放期间提高 speech start threshold；
-- 必须持续超过更高阈值一小段时间才算真正 barge-in；
-- 真正检测到近场用户说话后，再暂停 / 停止当前播放。
+可选策略：
 
-第一版如果不需要打断，也可以更简单：assistant 播放时直接暂停 VAD 的 speech start，只保留麦克风采样。
+- 播放期提高 speech-start threshold；
+- 开始播放后短暂建立 echo baseline；
+- 要求更长的连续近场人声才触发 barge-in；
+- MVP 阶段直接禁止 playback 期间新 speech start。
+
+当确实检测到 owner 说话，再暂停 / 停止当前音频。
 
 ---
 
-## 11. 电话 UI 最值得暴露的是“真实阶段”，不是假进度条
+## 14. 电话状态应该映射真实 pipeline 阶段
 
-建议状态至少区分：
+UI 至少可以区分：
 
 ```text
 listening
 hearing
 transcribing
+reviewing
 sending
 waiting
 playing
@@ -520,71 +911,76 @@ muted
 ended
 ```
 
-它们对应真实系统阶段：
+对应：
 
 ```text
-listening      麦克风空闲监听
-hearing        VAD 已检测到用户说话
-transcribing   ASR 处理中
-sending        正在把 transcript 投递到会话
-waiting        已投递，等待模型回复
-playing        TTS 已准备并正在播放
+listening      mic idle
+hearing        VAD active
+transcribing   ASR running
+reviewing      transcript ready, short correction window
+sending        request entering Bridge
+waiting        dispatched to official conversation, waiting callback
+playing        TTS ready and currently playing
 ```
 
-不要用一个固定“通话中”覆盖所有状态，否则后台失败时 UI 仍然看起来正常，很难排错。
+一个固定的“通话中”状态无法帮助排查 listener、ASR 或 TTS 到底卡在哪里。
 
 ---
 
-## 12. 延迟优化前先打完整 timing
+## 15. 延迟优化之前，先把整条 timing 打出来
 
-电话体验不好时，不要先猜是 TTS 慢。
-
-建议至少记录：
+至少记录：
 
 ```text
+speech_start
 speech_end
+wav_ready
 upload_done
 transcript_ready
+review_done
 request_enqueued
 request_claimed
+host_submit_started
+host_submission_returned
 request_dispatched
 reply_received
 first_tts_ready
 playback_started
 ```
 
-一次 turn 的时间线：
+一次电话 turn：
 
 ```text
 speech end
    │
-   ├─ ASR ───────────────┐
-   │                     │
-   ├─ queue / transport ─┤
-   │                     │
-   ├─ model generation ──┤
-   │                     │
-   ├─ first TTS ─────────┤
-   │                     │
-   └─ playback start ─────┘
+   ├─ encode/upload
+   ├─ ASR
+   ├─ transcript review
+   ├─ Bridge queue
+   ├─ listener claim
+   ├─ official host submit
+   ├─ official model generation
+   ├─ reply callback
+   ├─ first TTS
+   └─ playback start
 ```
 
-最后看每一段的 p50 / p90。
+建议看每一段的 p50 / p90，而非只记录总耗时。
 
-很多系统里真正最大的等待并不在 ASR 或 TTS，而在：
+我们实际遇到的慢点并不总在 ASR 或 TTS，也可能来自：
 
-- 请求排队；
-- browser / listener claim；
-- 外部模型开始生成之前；
-- 回复持久化和同步。
+- Bridge queue 等待；
+- listener claim；
+- official host composer 暂时不可用；
+- 官端模型生成；
+- reply callback 落账；
+- 第一个 TTS part 生成。
 
-只有量出来以后，才知道该优化哪一段。
+如果没有阶段 timing，很容易一直优化错误的组件。
 
 ---
 
-## 13. 一个够用的最小 API 形态
-
-可以从下面这些接口开始：
+## 16. 一个够用的本地 API 形态
 
 ```text
 POST /api/session/{session_id}/call
@@ -593,6 +989,7 @@ GET  /api/session/{session_id}/call/{call_id}
 
 POST /api/voice-attachments
 GET  /api/voice-attachments/{attachment_id}
+PATCH /api/voice-attachments/{attachment_id}/transcript
 
 POST /api/chat
 GET  /api/attachment/{attachment_id}
@@ -600,96 +997,146 @@ GET  /api/attachment/{attachment_id}
 
 ### `POST /api/voice-attachments`
 
-负责：
-
 ```text
-save audio
-→ start ASR in background
+persist audio
+→ start ASR
 → return attachment id immediately
 ```
 
+### `PATCH .../transcript`
+
+允许短 review window 内修正 transcript，同时保留 raw transcript。
+
 ### `POST /api/chat`
 
-电话模式额外带：
+电话 turn 带：
 
 ```json
 {
   "session_id": "session-001",
+  "transport": "chatgpt_bridge",
   "call_mode": true,
   "call_id": "call-001",
   "request_id": "req-001",
-  "message": "转写后的文本",
+  "message": "最终转写文本",
   "attachments": [
     { "id": "voice-attachment-id" }
   ]
 }
 ```
 
-### `GET /api/session/.../call/...`
+### `GET .../call/...`
 
-用来恢复：
+用于恢复：
 
-- 当前 call 是否仍 active；
-- 当前 request；
-- assistant reply parts；
-- TTS 是否 ready；
-- 是否已经挂断。
-
-这比只依赖前端内存稳得多。
-
----
-
-## 14. 最常见的几个故障
-
-### 1. 句首被切掉
-
-原因：VAD 检测到人声以后才开始录。
-
-处理：保留 pre-roll buffer。
-
-### 2. 背景噪音一直不结束
-
-原因：固定 threshold 不适应环境。
-
-处理：动态 noise floor + 最大单段时长。
-
-### 3. 语音已经上传，但消息偶尔没发出去
-
-原因：把“上传成功”“ASR ready”“聊天 request accepted”当成同一件事。
-
-处理：三层状态分开；没有拿到明确 `request_id` 前不要算投递成功。
-
-### 4. 下一轮回复播放成上一轮的声音
-
-原因：只看“最新 assistant message”，没有按 request / call 归属过滤。
-
-处理：所有 reply 和 voice part 都带 `request_id + call_id`。
-
-### 5. 第二段 TTS 慢，导致第一段也一直不播
-
-原因：等所有 part settled 才开始播放。
-
-处理：按顺序播放“已经连续 ready 的前缀”。
-
-### 6. 模型声音把自己 VAD 触发了
-
-原因：扬声器回声进入麦克风。
-
-处理：AEC + 播放期提高 barge-in 门槛，或者 MVP 直接禁用播放期 speech start。
-
-### 7. 刷新页面后整通电话丢失
-
-原因：call 状态只存在前端变量。
-
-处理：后端持久化 `call_id`、request 列表、reply parts 和结束状态；前端恢复时重新读取。
+- call active / ended；
+- 当前 in-flight request；
+- reply parts；
+- TTS readiness；
+- 播放进度；
+- pending end / farewell 状态。
 
 ---
 
-## 15. 如果还要做后台 / 锁屏，浏览器电话和原生 carrier 要分层
+## 17. 实际最容易踩的故障
 
-前台 PWA / 浏览器版本可以先把整条通路跑通。
+### 17.1 句首经常缺字
 
-但移动端进入后台或锁屏后，浏览器可能限制：
+**原因：** speech detection 之后才开始存 PCM。
+
+**处理：** pre-roll buffer。
+
+### 17.2 环境噪声让一句话永远不结束
+
+**原因：** 背景能量一直高于 keep threshold。
+
+**处理：** dynamic noise floor + hysteresis + hard max segment duration。
+
+### 17.3 环境声被识别成一句不存在的话
+
+**原因：** VAD 把噪声段送进 ASR，ASR 又倾向输出某个最可能文本。
+
+**处理：** 最短语音时长、能量过滤、confidence guard、异常 transcript review。
+
+### 17.4 高频口语 / 昵称被识别错
+
+**原因：** 通用 ASR 不知道个人词汇分布。
+
+**处理：** personal vocabulary prompt；允许快速人工修改；保留 raw transcript。
+
+### 17.5 二次“智能纠错”把原话改坏
+
+**原因：** ASR 后又让一个 LLM 重写 transcript。
+
+**处理：** 电话低延迟模式只给 ASR vocabulary hint，跳过第二轮 LLM correction；普通 voice message 可以继续启用。
+
+### 17.6 音频上传成功，但电话没有真正发出去
+
+**原因：** 把三个状态混为一谈：
+
+```text
+audio uploaded
+ASR ready
+Bridge request accepted
+```
+
+**处理：** 三层状态独立；只有拿到明确 `request_id` 并写入 request ledger 才算进入发送阶段。
+
+### 17.7 官端页面看见回复，本地电话却没收到
+
+**原因：** official visible bubble 出现不代表 authoritative callback 已完成。
+
+**处理：** 检查 `deliver_reply(request_id, reply_text)` 或对应 callback 是否真正到达后端；不要从页面 bubble 猜答案。
+
+### 17.8 下一轮突然播放上一轮的声音
+
+**原因：** 只取“最新 assistant reply”，没有按 `call_id + request_id` 过滤。
+
+**处理：** reply、TTS part、play queue 全部绑定 call/request。
+
+### 17.9 两个官端窗口偶发抢消息
+
+**原因：** 两个 listener 使用相同 binding。
+
+**处理：** 一窗口一 binding；旧窗口换绑后不再拥有原 lane。
+
+### 17.10 listener 看起来在线，实际已经 stale
+
+**原因：** 页面后台节流或 listener 生命周期已经断开。
+
+**处理：** heartbeat + stale window + reconnect；不要仅依赖前端“已连接”图标。
+
+### 17.11 TTS 第二段很慢，第一段也一直没声音
+
+**原因：** 等所有 speech part settled 才开始播放。
+
+**处理：** 生成并发，播放连续 ready 前缀。
+
+### 17.12 扬声器把模型自己的声音送回 VAD
+
+**原因：** AEC 不充分。
+
+**处理：** playback-aware VAD / higher barge-in threshold / MVP playback lock。
+
+### 17.13 Bridge 出错后电话仍有回答，但上下文味道变了
+
+**原因：** transport 静默 fallback 到另一个 API model。
+
+**处理：** 对这种架构禁止 silent fallback；Bridge failure 应显式暴露。
+
+### 17.14 刷新页面后电话状态丢失
+
+**原因：** call lifecycle 只存在 JS 内存。
+
+**处理：** 后端持久化 `call_id`、request list、reply parts、end state；前端恢复时重新读取。
+
+---
+
+## 18. 后台 / 锁屏：Web UI 和 native carrier 分层
+
+前台 PWA 可以先验证整条功能链。
+
+移动端进入后台或锁屏以后，浏览器常会限制：
 
 - microphone capture；
 - WebAudio；
@@ -697,111 +1144,141 @@ save audio
 - network scheduling；
 - 页面进程生命周期。
 
-如果目标是“像真正电话一样锁屏还能继续”，更稳的结构通常是：
+如果目标是锁屏仍能继续：
 
 ```text
 Web UI
   ↓ takeover
 Native foreground call service
   ├─ microphone
+  ├─ PCM / VAD
   ├─ playback
   ├─ persistent notification
   └─ same call_id / same backend session
 ```
 
-重点是**原生层只接管音频 carrier，不要另造一份聊天会话。**
+原生层只接管 carrier，仍然复用：
 
-Web 页面回来以后继续读取同一个 `call_id` 的状态即可。
+```text
+same session_id
+same call_id
+same Bridge
+same official ChatGPT conversation
+same reply ledger
+```
 
-这部分已经属于第二阶段，不建议和第一版浏览器电话一起开工。
+Web 页面重新回到前台以后，从后端恢复当前 call，而非新建一通电话。
 
 ---
 
-## 16. 推荐施工顺序
+## 19. 推荐施工顺序
 
-如果从零实现，建议按下面顺序：
-
-```text
-1. getUserMedia 能稳定拿到 PCM
-2. VAD 能切出一段完整人声
-3. 音频能保存并手动播放
-4. ASR attachment 状态机跑通
-5. transcript 能进入已有 session
-6. assistant reply 能回到本地 ledger
-7. 单段自定义 TTS 能播放
-8. 多段 TTS 能首段先播、顺序不乱
-9. 加 call_id / request_id 恢复与去重
-10. 最后再做 barge-in、后台、锁屏和视觉
-```
-
-每一步都可以单独验收。
-
-不要一开始同时调：
+如果从零做，建议分层验收：
 
 ```text
-VAD + ASR + model + TTS + background + UI
+1. 先把 ChatGPT Bridge 做稳定
+   - dedicated binding
+   - listener heartbeat / reconnect
+   - request_id
+   - authoritative reply callback
+   - idempotent reply
+
+2. getUserMedia / native mic 能稳定拿 PCM
+
+3. VAD 能切出完整一句
+   - pre-roll
+   - dynamic noise floor
+   - hard max duration
+
+4. audio attachment + ASR 状态机跑通
+
+5. personal vocabulary + transcript review 跑通
+
+6. transcript 能作为 call_mode request 进入原官方 conversation
+
+7. authoritative reply 能回本地 ledger
+
+8. 单段自定义 TTS 能播放
+
+9. 多段 TTS progressive generation + ordered playback
+
+10. call_id / request_id 恢复、去重和迟到回复过滤
+
+11. playback-aware VAD / barge-in
+
+12. 最后做 native background / lock screen
 ```
 
-否则延迟和故障会很难定位。
+不要第一天同时调：
+
+```text
+Bridge + VAD + ASR + official host + TTS + background + UI
+```
+
+分层验收以后，任何一次电话失败都更容易定位。
 
 ---
 
-## 17. 一个更容易记住的模型
+## 20. 最小验收清单
 
-整条链路可以压成五句话：
-
-```text
-Audio becomes a durable attachment before it becomes text.
-Text enters the existing conversation instead of a second phone-only context.
-Every turn is identified by session + call + request.
-TTS may prepare in parallel, but playback stays ordered.
-Measure each latency stage before optimizing it.
-```
-
-翻成中文：
+在继续做更复杂的 full-duplex 以前，至少确认：
 
 ```text
-声音先变成可恢复的附件，再变成文字。
-文字进入原有会话，不另建电话专属上下文。
-每一轮都用 session + call + request 明确归属。
-TTS 可以并发准备，但播放顺序不能乱。
-优化前先量清楚每一段延迟。
+[ ] 一个 local session 只进入绑定的官方 conversation
+[ ] 两个独立 binding 可以并行，不抢 request
+[ ] listener 断开后可以明确发现并恢复
+[ ] 同 request_id 的重复 callback 不会重复落账
+[ ] Bridge failure 不会静默改走别的模型
+
+[ ] 句首不会被 VAD 吃掉
+[ ] 持续背景噪声不会让 segment 永久不结束
+[ ] 原始音频先持久化，再进行 ASR
+[ ] personal vocabulary 会进入 ASR
+[ ] call mode 可以关闭第二轮 LLM transcript correction
+[ ] transcript 可以在投递前快速修正
+
+[ ] reply 只按当前 call_id / request_id 播放
+[ ] TTS part 可以并发准备但严格顺序播放
+[ ] 第一段 ready 后无需等待最后一段
+[ ] playback 不会频繁触发自己的 VAD
+
+[ ] 刷新页面后仍能恢复当前 call
+[ ] 后台 carrier 使用同一个 call_id / session_id
+[ ] latency timing 能拆到 ASR / Bridge / official model / TTS
 ```
+
+这些通过以后，再继续做更激进的 interruption、full-duplex 或主动来电，会省很多排错时间。
 
 ---
 
-## 18. 本篇不包含
+## 21. 本篇不包含
 
-为了把重点放在“自定义声线电话”的关键通路，本篇不展开：
+为了保持公开教程可复现，同时不暴露私人生产环境，本篇不展开：
 
-- 具体 AI 角色 prompt；
-- 私人记忆系统；
-- 某个供应商的完整账号 / API 配置；
-- 声线训练或克隆教程；
+- 具体角色 prompt；
+- 私人记忆系统内容；
+- 真实官方 conversation binding；
+- 真实 token、PIN、密钥和域名；
 - 具体 ElevenLabs voice ID；
-- 私人域名、token、PIN、服务器路径；
-- 完整生产项目源码；
+- 声线训练 / 克隆教程；
+- 完整生产仓库源码；
 - 电话页面视觉设计；
-- 主动来电、主动挂断、睡前陪伴等产品层策略。
+- 主动来电、主动挂断等产品层策略。
 
-本文主要讨论可以独立复现的工程骨架：**连续收音、VAD、ASR、会话投递、TTS、播放顺序、状态恢复和延迟测量。**
+这里保留的是可独立复现的技术骨架：
 
----
-
-## 19. 关于示例与隐私
-
-本文来自一个实际长期使用的私人 AI 电话系统，但所有公开示例都只保留通用结构。
-
-公开版本不包含：
-
-- 真实声线 ID；
-- 真实密钥；
-- 私人 prompt；
-- 内部域名和生产地址；
-- 私人聊天内容；
-- 完整私有源码。
-
-如果你已经有自己的聊天前端或 agent，只需要把本文的音频输入 / 输出链嵌入现有 session 层，不需要照搬我们的项目结构。
+```text
+owner audio
+→ VAD
+→ durable voice attachment
+→ vocabulary-aware ASR
+→ reviewable transcript
+→ ChatGPT Bridge
+→ bound official Chat / Work conversation
+→ authoritative callback
+→ custom voice TTS
+→ ordered playback
+```
 
 ---
 
