@@ -221,7 +221,7 @@ replied
 例如：
 
 ```text
-PWA creates request
+client creates request
   ↓ queued
 Bridge listener claims
   ↓ claimed
@@ -1130,42 +1130,95 @@ Bridge request accepted
 
 ---
 
-## 18. 后台 / 锁屏：Web UI 和 native carrier 分层
+## 18. 后台 / 锁屏：两种客户端形态，共用同一套后端协议
 
-前台 PWA 可以先验证整条功能链。
+移动端电话常见有两种实现方式。
 
-移动端进入后台或锁屏以后，浏览器常会限制：
+### 18.1 Web / PWA 前端 + Android 原生承载层
 
-- microphone capture；
-- WebAudio；
-- timer；
-- network scheduling；
-- 页面进程生命周期。
-
-如果目标是锁屏仍能继续：
+如果主要界面和前台通话逻辑已经在 Web / PWA 中，可以只把浏览器在后台和锁屏状态下不稳定的部分交给 Android 原生层。
 
 ```text
-Web UI
-  ↓ takeover
-Native foreground call service
-  ├─ microphone
+Web / PWA frontend
+  ├─ call UI
+  ├─ foreground microphone / VAD
+  ├─ transcript review
+  ├─ call state display
+  └─ request / reply orchestration
+
+Android native carrier
+  ├─ foreground service
+  ├─ background / lock-screen microphone capture
   ├─ PCM / VAD
-  ├─ playback
+  ├─ audio playback
   ├─ persistent notification
-  └─ same call_id / same backend session
+  └─ entry back to the active call
 ```
 
-原生层只接管 carrier，仍然复用：
+浏览器进入后台或设备锁屏以后，常见限制包括：
+
+- microphone capture 被暂停或回收；
+- WebAudio 停止；
+- timer 被节流；
+- network scheduling 延迟；
+- 页面进程被系统挂起或销毁。
+
+因此前台正常通话时可以由 Web / PWA 持有音频链；需要后台继续时，再把 carrier ownership 交给 Android 原生层：
+
+```text
+Web / PWA foreground call
+  ↓ handoff / takeover
+Android foreground call service
+  ↓
+continue the same call
+```
+
+这里的原生层只承担系统级 carrier / lifecycle 能力，不需要再实现第二套 conversation、模型调用或业务状态。
+
+### 18.2 Fully native Android frontend
+
+如果客户端本来就是原生 Android 应用，也可以直接把整套电话前端放在 Android 中：
+
+```text
+Native Android frontend
+  ├─ call UI
+  ├─ microphone capture
+  ├─ PCM / VAD
+  ├─ transcript review
+  ├─ audio playback
+  ├─ foreground service
+  └─ persistent notification
+```
+
+这种形态不需要 Web → native handoff，因为前台和后台本来就在同一个原生客户端里。
+
+### 18.3 两种形态都应该保持同一套后端身份
+
+无论客户端采用哪一种形态，进入后端以后都应继续使用同一套电话身份和状态：
 
 ```text
 same session_id
 same call_id
+same request_id lifecycle
 same Bridge
 same official ChatGPT conversation
 same reply ledger
+same ASR / TTS backend
 ```
 
-Web 页面重新回到前台以后，从后端恢复当前 call，而非新建一通电话。
+客户端层负责采集、播放、UI 和系统生命周期；conversation continuity、Bridge request、authoritative callback 和 reply ledger 仍然由后端协议保证。
+
+如果使用 Web / PWA + native carrier，PWA 回到前台以后应从后端恢复当前 call，而不是新建一通电话：
+
+```text
+Android carrier active
+  ↓ Web / PWA resumes
+GET current call state
+  ↓
+restore the same call
+```
+
+这样客户端实现可以按项目需要选择 Web、混合或纯原生，而不需要改变 Bridge 和电话后端的核心协议。
 
 ---
 
@@ -1240,8 +1293,8 @@ Bridge + VAD + ASR + official host + TTS + background + UI
 [ ] 第一段 ready 后无需等待最后一段
 [ ] playback 不会频繁触发自己的 VAD
 
-[ ] 刷新页面后仍能恢复当前 call
-[ ] 后台 carrier 使用同一个 call_id / session_id
+[ ] 如果使用 Web / PWA，刷新后仍能恢复当前 call
+[ ] 如果使用 native background carrier，handoff 前后仍使用同一个 call_id / session_id
 [ ] latency timing 能拆到 ASR / Bridge / official model / TTS
 ```
 
