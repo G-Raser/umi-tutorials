@@ -47,8 +47,6 @@ ordered progressive playback
 - 后台 / 锁屏 carrier；
 - 实际长期运行中遇到的故障和延迟定位方法。
 
-本文不包含私人 prompt、真实声线 ID、真实密钥、内部域名或完整生产源码。
-
 ---
 
 ## 1. 核心架构：电话只是官方会话的一条新 I/O 通路
@@ -1248,37 +1246,6 @@ Bridge + VAD + ASR + official host + TTS + background + UI
 ```
 
 这些通过以后，再继续做更激进的 interruption、full-duplex 或主动来电，会省很多排错时间。
-
----
-
-## 21. 本篇不包含
-
-为了保持公开教程可复现，同时不暴露私人生产环境，本篇不展开：
-
-- 具体角色 prompt；
-- 私人记忆系统内容；
-- 真实官方 conversation binding；
-- 真实 token、PIN、密钥和域名；
-- 具体 ElevenLabs voice ID；
-- 声线训练 / 克隆教程；
-- 完整生产仓库源码；
-- 电话页面视觉设计；
-- 主动来电、主动挂断等产品层策略。
-
-这里保留的是可独立复现的技术骨架：
-
-```text
-owner audio
-→ VAD
-→ durable voice attachment
-→ vocabulary-aware ASR
-→ reviewable transcript
-→ ChatGPT Bridge
-→ bound official Chat / Work conversation
-→ authoritative callback
-→ custom voice TTS
-→ ordered playback
-```
 
 ---
 
